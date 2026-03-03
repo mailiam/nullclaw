@@ -925,6 +925,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (store.get("pgvector_table")) |v| if (v == .string) {
                                 self.memory.search.store.pgvector_table = try self.allocator.dupe(u8, v.string);
                             };
+                            if (store.get("ann_candidate_multiplier")) |v| if (v == .integer) {
+                                self.memory.search.store.ann_candidate_multiplier = @intCast(v.integer);
+                            };
+                            if (store.get("ann_min_candidates")) |v| if (v == .integer) {
+                                self.memory.search.store.ann_min_candidates = @intCast(v.integer);
+                            };
                         }
                     }
 

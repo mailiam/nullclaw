@@ -41,6 +41,232 @@ pub fn freeVectorResults(allocator: Allocator, results: []VectorResult) void {
     allocator.free(results);
 }
 
+const ANN_SIGNATURE_BITS: u32 = 64;
+const ANN_BAND_BITS: u32 = 16;
+const ANN_BAND_COUNT: u32 = ANN_SIGNATURE_BITS / ANN_BAND_BITS;
+const ANN_DEFAULT_CANDIDATE_MULTIPLIER: u32 = 12;
+const ANN_DEFAULT_MIN_CANDIDATES: u32 = 64;
+
+fn queryNorm(query_embedding: []const f32) f64 {
+    if (query_embedding.len == 0) return 0.0;
+
+    var norm_sq: f64 = 0.0;
+    for (query_embedding) |q_raw| {
+        const q: f64 = @floatCast(q_raw);
+        norm_sq += q * q;
+    }
+    return @sqrt(norm_sq);
+}
+
+fn cosineSimilarityBlob(query_embedding: []const f32, query_norm: f64, blob: []const u8) f32 {
+    if (query_embedding.len == 0) return 0.0;
+    if (blob.len != query_embedding.len * 4) return 0.0;
+    if (!std.math.isFinite(query_norm) or query_norm < std.math.floatEps(f64)) return 0.0;
+
+    var dot: f64 = 0.0;
+    var norm_blob_sq: f64 = 0.0;
+
+    for (query_embedding, 0..) |q_raw, i| {
+        const chunk = blob[i * 4 ..][0..4];
+        const blob_val: f32 = @bitCast(chunk.*);
+
+        const q: f64 = @floatCast(q_raw);
+        const b: f64 = @floatCast(blob_val);
+        dot += q * b;
+        norm_blob_sq += b * b;
+    }
+
+    const denom = query_norm * @sqrt(norm_blob_sq);
+    if (!std.math.isFinite(denom) or denom < std.math.floatEps(f64)) return 0.0;
+
+    const raw = dot / denom;
+    if (!std.math.isFinite(raw)) return 0.0;
+
+    const clamped = @max(0.0, @min(1.0, raw));
+    return @floatCast(clamped);
+}
+
+fn indexOfLowestScore(results: []const VectorResult) usize {
+    if (results.len == 0) return 0;
+    var idx: usize = 0;
+    var score = results[0].score;
+    for (results[1..], 1..) |r, i| {
+        if (r.score < score) {
+            score = r.score;
+            idx = i;
+        }
+    }
+    return idx;
+}
+
+fn appendTopKCandidate(
+    alloc: Allocator,
+    candidates: *std.ArrayListUnmanaged(VectorResult),
+    max_results: usize,
+    key: []const u8,
+    score: f32,
+    lowest_idx: *usize,
+    lowest_score: *f32,
+) !void {
+    if (max_results == 0) return;
+
+    if (candidates.items.len < max_results) {
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+
+        try candidates.append(alloc, .{
+            .key = owned_key,
+            .score = score,
+        });
+        if (candidates.items.len == 1 or score < lowest_score.*) {
+            lowest_idx.* = candidates.items.len - 1;
+            lowest_score.* = score;
+        }
+        return;
+    }
+
+    if (score <= lowest_score.*) return;
+
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+
+    candidates.items[lowest_idx.*].deinit(alloc);
+    candidates.items[lowest_idx.*] = .{
+        .key = owned_key,
+        .score = score,
+    };
+
+    lowest_idx.* = indexOfLowestScore(candidates.items);
+    lowest_score.* = candidates.items[lowest_idx.*].score;
+}
+
+fn exactSearchSqlite(
+    db: ?*c.sqlite3,
+    alloc: Allocator,
+    query_embedding: []const f32,
+    max_results: usize,
+) anyerror![]VectorResult {
+    if (max_results == 0) return alloc.alloc(VectorResult, 0);
+
+    const query_norm = queryNorm(query_embedding);
+    const sql = "SELECT memory_key, embedding FROM memory_embeddings";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    var candidates: std.ArrayListUnmanaged(VectorResult) = .empty;
+    errdefer {
+        for (candidates.items) |*r| r.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+
+    var lowest_idx: usize = 0;
+    var lowest_score: f32 = 0.0;
+
+    while (true) {
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const key_ptr = c.sqlite3_column_text(stmt, 0);
+            const key_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            if (key_ptr == null) continue;
+
+            const blob_ptr: ?[*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
+            const blob_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            if (blob_ptr == null or blob_len == 0) continue;
+
+            const score = cosineSimilarityBlob(query_embedding, query_norm, blob_ptr.?[0..blob_len]);
+            const key_slice: []const u8 = key_ptr[0..key_len];
+            try appendTopKCandidate(alloc, &candidates, max_results, key_slice, score, &lowest_idx, &lowest_score);
+        } else break;
+    }
+
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+    std.mem.sortUnstable(VectorResult, candidates.items, {}, struct {
+        fn lessThan(_: void, a: VectorResult, b: VectorResult) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    const result = try alloc.dupe(VectorResult, candidates.items);
+    candidates.deinit(alloc);
+    return result;
+}
+
+fn annCandidateLimit(limit: u32, candidate_multiplier: u32, min_candidates: u32) u32 {
+    if (limit == 0) return 0;
+
+    const multiplier = @max(candidate_multiplier, @as(u32, 1));
+    const scaled_u64 = @as(u64, limit) * @as(u64, multiplier);
+    const scaled = @as(u32, @intCast(@min(scaled_u64, @as(u64, std.math.maxInt(u32)))));
+    return @max(scaled, @max(limit, min_candidates));
+}
+
+fn mix64(x_raw: u64) u64 {
+    var x = x_raw;
+    x ^= x >> 30;
+    x *%= 0xbf58476d1ce4e5b9;
+    x ^= x >> 27;
+    x *%= 0x94d049bb133111eb;
+    x ^= x >> 31;
+    return x;
+}
+
+fn projectionCoeff(bit_idx: u32, dim_idx: usize) f64 {
+    const seed_a = @as(u64, bit_idx) * 0x9E3779B185EBCA87;
+    const seed_b = @as(u64, @intCast(dim_idx)) * 0xC2B2AE3D27D4EB4F;
+    const hashed = mix64(seed_a ^ seed_b ^ 0xD6E8FEB86659FD93);
+    const unit = @as(f64, @floatFromInt(hashed & 0xFFFF)) / 65535.0;
+    return (unit * 2.0) - 1.0;
+}
+
+fn simhashSignatureFromEmbedding(embedding: []const f32) u64 {
+    var sig: u64 = 0;
+    var bit_idx: u32 = 0;
+    while (bit_idx < ANN_SIGNATURE_BITS) : (bit_idx += 1) {
+        var dot: f64 = 0.0;
+        for (embedding, 0..) |val_raw, dim_idx| {
+            const val: f64 = @floatCast(val_raw);
+            dot += val * projectionCoeff(bit_idx, dim_idx);
+        }
+        if (dot >= 0.0) {
+            sig |= (@as(u64, 1) << @intCast(bit_idx));
+        }
+    }
+    return sig;
+}
+
+fn simhashSignatureFromBlob(blob: []const u8) u64 {
+    const dims = blob.len / 4;
+    if (dims == 0) return 0;
+
+    var sig: u64 = 0;
+    var bit_idx: u32 = 0;
+    while (bit_idx < ANN_SIGNATURE_BITS) : (bit_idx += 1) {
+        var dot: f64 = 0.0;
+        var dim_idx: usize = 0;
+        while (dim_idx < dims) : (dim_idx += 1) {
+            const chunk = blob[dim_idx * 4 ..][0..4];
+            const val: f32 = @bitCast(chunk.*);
+            dot += @as(f64, @floatCast(val)) * projectionCoeff(bit_idx, dim_idx);
+        }
+        if (dot >= 0.0) {
+            sig |= (@as(u64, 1) << @intCast(bit_idx));
+        }
+    }
+    return sig;
+}
+
+fn signatureBands(sig: u64) [ANN_BAND_COUNT]u16 {
+    return .{
+        @intCast(sig & 0xFFFF),
+        @intCast((sig >> 16) & 0xFFFF),
+        @intCast((sig >> 32) & 0xFFFF),
+        @intCast((sig >> 48) & 0xFFFF),
+    };
+}
+
 // ── VectorStore vtable ────────────────────────────────────────────
 
 pub const VectorStore = struct {
@@ -113,58 +339,6 @@ pub const SqliteSharedVectorStore = struct {
 
     // ── vtable implementations ────────────────────────────────────
 
-    fn queryNorm(query_embedding: []const f32) f64 {
-        if (query_embedding.len == 0) return 0.0;
-
-        var norm_sq: f64 = 0.0;
-        for (query_embedding) |q_raw| {
-            const q: f64 = @floatCast(q_raw);
-            norm_sq += q * q;
-        }
-        return @sqrt(norm_sq);
-    }
-
-    fn cosineSimilarityBlob(query_embedding: []const f32, query_norm: f64, blob: []const u8) f32 {
-        if (query_embedding.len == 0) return 0.0;
-        if (blob.len != query_embedding.len * 4) return 0.0;
-        if (!std.math.isFinite(query_norm) or query_norm < std.math.floatEps(f64)) return 0.0;
-
-        var dot: f64 = 0.0;
-        var norm_blob_sq: f64 = 0.0;
-
-        for (query_embedding, 0..) |q_raw, i| {
-            const chunk = blob[i * 4 ..][0..4];
-            const blob_val: f32 = @bitCast(chunk.*);
-
-            const q: f64 = @floatCast(q_raw);
-            const b: f64 = @floatCast(blob_val);
-            dot += q * b;
-            norm_blob_sq += b * b;
-        }
-
-        const denom = query_norm * @sqrt(norm_blob_sq);
-        if (!std.math.isFinite(denom) or denom < std.math.floatEps(f64)) return 0.0;
-
-        const raw = dot / denom;
-        if (!std.math.isFinite(raw)) return 0.0;
-
-        const clamped = @max(0.0, @min(1.0, raw));
-        return @floatCast(clamped);
-    }
-
-    fn indexOfLowestScore(results: []const VectorResult) usize {
-        if (results.len == 0) return 0;
-        var idx: usize = 0;
-        var score = results[0].score;
-        for (results[1..], 1..) |r, i| {
-            if (r.score < score) {
-                score = r.score;
-                idx = i;
-            }
-        }
-        return idx;
-    }
-
     fn implUpsert(ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -186,85 +360,7 @@ pub const SqliteSharedVectorStore = struct {
 
     fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const max_results: usize = @intCast(limit);
-        if (max_results == 0) return alloc.alloc(VectorResult, 0);
-
-        const query_norm = queryNorm(query_embedding);
-
-        const sql = "SELECT memory_key, embedding FROM memory_embeddings";
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        var candidates: std.ArrayListUnmanaged(VectorResult) = .empty;
-        errdefer {
-            for (candidates.items) |*r| r.deinit(alloc);
-            candidates.deinit(alloc);
-        }
-
-        var lowest_idx: usize = 0;
-        var lowest_score: f32 = 0.0;
-
-        while (true) {
-            rc = c.sqlite3_step(stmt);
-            if (rc == c.SQLITE_ROW) {
-                // Read key
-                const key_ptr = c.sqlite3_column_text(stmt, 0);
-                const key_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-                if (key_ptr == null) continue;
-
-                // Read embedding blob
-                const blob_ptr: ?[*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
-                const blob_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
-
-                if (blob_ptr == null or blob_len == 0) continue;
-
-                const score = cosineSimilarityBlob(query_embedding, query_norm, blob_ptr.?[0..blob_len]);
-
-                if (candidates.items.len < max_results) {
-                    const owned_key = try alloc.dupe(u8, key_ptr[0..key_len]);
-                    errdefer alloc.free(owned_key);
-
-                    try candidates.append(alloc, .{
-                        .key = owned_key,
-                        .score = score,
-                    });
-                    if (candidates.items.len == 1 or score < lowest_score) {
-                        lowest_idx = candidates.items.len - 1;
-                        lowest_score = score;
-                    }
-                } else {
-                    if (score <= lowest_score) continue;
-
-                    const owned_key = try alloc.dupe(u8, key_ptr[0..key_len]);
-                    errdefer alloc.free(owned_key);
-
-                    candidates.items[lowest_idx].deinit(alloc);
-                    candidates.items[lowest_idx] = .{
-                        .key = owned_key,
-                        .score = score,
-                    };
-
-                    lowest_idx = indexOfLowestScore(candidates.items);
-                    lowest_score = candidates.items[lowest_idx].score;
-                }
-            } else break;
-        }
-
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
-
-        // Sort by score descending
-        std.mem.sortUnstable(VectorResult, candidates.items, {}, struct {
-            fn lessThan(_: void, a: VectorResult, b: VectorResult) bool {
-                return a.score > b.score;
-            }
-        }.lessThan);
-
-        // Return owned slice
-        const result = try alloc.dupe(VectorResult, candidates.items);
-        candidates.deinit(alloc);
-        return result;
+        return exactSearchSqlite(self.db, alloc, query_embedding, @intCast(limit));
     }
 
     fn implDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
@@ -423,6 +519,348 @@ pub const SqliteSidecarVectorStore = struct {
         .delete = SqliteSharedVectorStore.vtable_instance.delete,
         .count = SqliteSharedVectorStore.vtable_instance.count,
         .health_check = SqliteSharedVectorStore.vtable_instance.health_check,
+        .deinit = &implDeinit,
+    };
+};
+
+// ── Sqlite ANN vector store (experimental) ────────────────────────
+//
+// Uses a lightweight SimHash+band prefilter in SQLite to cut the search
+// candidate set, then computes exact cosine on candidates. Falls back to
+// exact search when ANN candidate recall is insufficient.
+
+pub const SqliteAnnVectorStore = struct {
+    db: ?*c.sqlite3, // borrowed from SqliteMemory — NOT owned
+    allocator: Allocator,
+    owns_self: bool = false,
+    candidate_multiplier: u32 = ANN_DEFAULT_CANDIDATE_MULTIPLIER,
+    min_candidates: u32 = ANN_DEFAULT_MIN_CANDIDATES,
+
+    const Self = @This();
+
+    pub fn init(
+        allocator: Allocator,
+        db: ?*c.sqlite3,
+        candidate_multiplier: u32,
+        min_candidates: u32,
+    ) !SqliteAnnVectorStore {
+        var self = Self{
+            .db = db,
+            .allocator = allocator,
+            .candidate_multiplier = @max(candidate_multiplier, @as(u32, 1)),
+            .min_candidates = @max(min_candidates, @as(u32, 1)),
+        };
+        try self.migrateAnn();
+        try self.backfillAnnIfNeeded();
+        return self;
+    }
+
+    pub fn store(self: *SqliteAnnVectorStore) VectorStore {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_instance,
+        };
+    }
+
+    pub fn deinit(self: *SqliteAnnVectorStore) void {
+        // Do NOT close db — it's borrowed from SqliteMemory.
+        if (self.owns_self) {
+            self.allocator.destroy(self);
+        }
+    }
+
+    fn migrateAnn(self: *Self) !void {
+        const ddl =
+            \\CREATE TABLE IF NOT EXISTS memory_embedding_ann (
+            \\  memory_key TEXT PRIMARY KEY,
+            \\  band0 INTEGER NOT NULL,
+            \\  band1 INTEGER NOT NULL,
+            \\  band2 INTEGER NOT NULL,
+            \\  band3 INTEGER NOT NULL,
+            \\  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            \\  FOREIGN KEY (memory_key) REFERENCES memory_embeddings(memory_key) ON DELETE CASCADE
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_memory_embedding_ann_band0 ON memory_embedding_ann(band0);
+            \\CREATE INDEX IF NOT EXISTS idx_memory_embedding_ann_band1 ON memory_embedding_ann(band1);
+            \\CREATE INDEX IF NOT EXISTS idx_memory_embedding_ann_band2 ON memory_embedding_ann(band2);
+            \\CREATE INDEX IF NOT EXISTS idx_memory_embedding_ann_band3 ON memory_embedding_ann(band3);
+            \\DELETE FROM memory_embedding_ann WHERE memory_key NOT IN (SELECT memory_key FROM memory_embeddings);
+        ;
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(self.db, ddl, null, null, &err_msg);
+        if (rc != c.SQLITE_OK) {
+            if (err_msg) |msg| c.sqlite3_free(msg);
+            return error.MigrationFailed;
+        }
+    }
+
+    fn countWithSql(self: *Self, sql: [:0]const u8) !usize {
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const n = c.sqlite3_column_int64(stmt, 0);
+            return @intCast(n);
+        }
+        return 0;
+    }
+
+    fn backfillAnnIfNeeded(self: *Self) !void {
+        const emb_count = try self.countWithSql("SELECT COUNT(*) FROM memory_embeddings");
+        if (emb_count == 0) return;
+
+        const ann_count = try self.countWithSql("SELECT COUNT(*) FROM memory_embedding_ann");
+        if (ann_count >= emb_count) return;
+
+        try self.rebuildAnnIndex();
+    }
+
+    fn rebuildAnnIndex(self: *Self) !void {
+        const select_sql = "SELECT memory_key, embedding FROM memory_embeddings";
+        var select_stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &select_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(select_stmt);
+
+        const upsert_sql =
+            "INSERT OR REPLACE INTO memory_embedding_ann (memory_key, band0, band1, band2, band3, updated_at) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))";
+        var upsert_stmt: ?*c.sqlite3_stmt = null;
+        rc = c.sqlite3_prepare_v2(self.db, upsert_sql, -1, &upsert_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(upsert_stmt);
+
+        while (true) {
+            rc = c.sqlite3_step(select_stmt);
+            if (rc == c.SQLITE_ROW) {
+                const key_ptr = c.sqlite3_column_text(select_stmt, 0);
+                const key_len: usize = @intCast(c.sqlite3_column_bytes(select_stmt, 0));
+                if (key_ptr == null) continue;
+
+                const blob_ptr: ?[*]const u8 = @ptrCast(c.sqlite3_column_blob(select_stmt, 1));
+                const blob_len: usize = @intCast(c.sqlite3_column_bytes(select_stmt, 1));
+                if (blob_ptr == null or blob_len == 0) continue;
+
+                const sig = simhashSignatureFromBlob(blob_ptr.?[0..blob_len]);
+                const bands = signatureBands(sig);
+
+                _ = c.sqlite3_reset(upsert_stmt);
+                _ = c.sqlite3_clear_bindings(upsert_stmt);
+                _ = c.sqlite3_bind_text(upsert_stmt, 1, key_ptr, @intCast(key_len), SQLITE_STATIC);
+                _ = c.sqlite3_bind_int(upsert_stmt, 2, @intCast(bands[0]));
+                _ = c.sqlite3_bind_int(upsert_stmt, 3, @intCast(bands[1]));
+                _ = c.sqlite3_bind_int(upsert_stmt, 4, @intCast(bands[2]));
+                _ = c.sqlite3_bind_int(upsert_stmt, 5, @intCast(bands[3]));
+
+                const step_rc = c.sqlite3_step(upsert_stmt);
+                if (step_rc != c.SQLITE_DONE) return error.StepFailed;
+            } else break;
+        }
+
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn upsertAnn(self: *Self, key: []const u8, sig: u64) !void {
+        const bands = signatureBands(sig);
+        const sql =
+            "INSERT OR REPLACE INTO memory_embedding_ann (memory_key, band0, band1, band2, band3, updated_at) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))";
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int(stmt, 2, @intCast(bands[0]));
+        _ = c.sqlite3_bind_int(stmt, 3, @intCast(bands[1]));
+        _ = c.sqlite3_bind_int(stmt, 4, @intCast(bands[2]));
+        _ = c.sqlite3_bind_int(stmt, 5, @intCast(bands[3]));
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn implUpsert(ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const blob = try vector.vecToBytes(self.allocator, embedding);
+        defer self.allocator.free(blob);
+
+        const sql = "INSERT OR REPLACE INTO memory_embeddings (memory_key, embedding, updated_at) VALUES (?1, ?2, datetime('now'))";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_blob(stmt, 2, blob.ptr, @intCast(blob.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        try self.upsertAnn(key, simhashSignatureFromEmbedding(embedding));
+    }
+
+    fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const max_results: usize = @intCast(limit);
+        if (max_results == 0) return alloc.alloc(VectorResult, 0);
+
+        const query_norm = queryNorm(query_embedding);
+        const sig = simhashSignatureFromEmbedding(query_embedding);
+        const bands = signatureBands(sig);
+        const candidate_limit = annCandidateLimit(limit, self.candidate_multiplier, self.min_candidates);
+
+        const sql =
+            "SELECT e.memory_key, e.embedding " ++
+            "FROM memory_embeddings e " ++
+            "JOIN memory_embedding_ann a ON a.memory_key = e.memory_key " ++
+            "WHERE a.band0 = ?1 OR a.band1 = ?2 OR a.band2 = ?3 OR a.band3 = ?4 " ++
+            "LIMIT ?5";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_int(stmt, 1, @intCast(bands[0]));
+        _ = c.sqlite3_bind_int(stmt, 2, @intCast(bands[1]));
+        _ = c.sqlite3_bind_int(stmt, 3, @intCast(bands[2]));
+        _ = c.sqlite3_bind_int(stmt, 4, @intCast(bands[3]));
+        _ = c.sqlite3_bind_int(stmt, 5, @intCast(candidate_limit));
+
+        var candidates: std.ArrayListUnmanaged(VectorResult) = .empty;
+        errdefer {
+            for (candidates.items) |*r| r.deinit(alloc);
+            candidates.deinit(alloc);
+        }
+
+        var lowest_idx: usize = 0;
+        var lowest_score: f32 = 0.0;
+        var candidate_rows: usize = 0;
+
+        while (true) {
+            rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_ROW) {
+                candidate_rows += 1;
+
+                const key_ptr = c.sqlite3_column_text(stmt, 0);
+                const key_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+                if (key_ptr == null) continue;
+
+                const blob_ptr: ?[*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1));
+                const blob_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+                if (blob_ptr == null or blob_len == 0) continue;
+
+                const score = cosineSimilarityBlob(query_embedding, query_norm, blob_ptr.?[0..blob_len]);
+                const key_slice: []const u8 = key_ptr[0..key_len];
+                try appendTopKCandidate(alloc, &candidates, max_results, key_slice, score, &lowest_idx, &lowest_score);
+            } else break;
+        }
+
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        // Conservative fallback: if ANN prefilter yields too few candidates, run exact.
+        if (candidate_rows < max_results or candidates.items.len < max_results) {
+            for (candidates.items) |*r| r.deinit(alloc);
+            candidates.deinit(alloc);
+            return exactSearchSqlite(self.db, alloc, query_embedding, max_results);
+        }
+
+        std.mem.sortUnstable(VectorResult, candidates.items, {}, struct {
+            fn lessThan(_: void, a: VectorResult, b: VectorResult) bool {
+                return a.score > b.score;
+            }
+        }.lessThan);
+
+        const result = try alloc.dupe(VectorResult, candidates.items);
+        candidates.deinit(alloc);
+        return result;
+    }
+
+    fn implDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        // Keep ANN side table in sync regardless of FK settings.
+        const ann_sql = "DELETE FROM memory_embedding_ann WHERE memory_key = ?1";
+        var ann_stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, ann_sql, -1, &ann_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(ann_stmt);
+
+        _ = c.sqlite3_bind_text(ann_stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(ann_stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        const sql = "DELETE FROM memory_embeddings WHERE memory_key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn implCount(ptr: *anyopaque) anyerror!usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.countWithSql("SELECT COUNT(*) FROM memory_embeddings");
+    }
+
+    fn implHealthCheck(ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const start = std.time.nanoTimestamp();
+
+        const sql = "SELECT COUNT(*) FROM memory_embeddings";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) {
+            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+            return HealthStatus{
+                .ok = false,
+                .latency_ns = elapsed,
+                .entry_count = null,
+                .error_msg = try alloc.dupe(u8, "sqlite prepare failed"),
+            };
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        rc = c.sqlite3_step(stmt);
+        const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+
+        if (rc == c.SQLITE_ROW) {
+            const n: usize = @intCast(c.sqlite3_column_int64(stmt, 0));
+            return HealthStatus{
+                .ok = true,
+                .latency_ns = elapsed,
+                .entry_count = n,
+                .error_msg = null,
+            };
+        }
+
+        return HealthStatus{
+            .ok = false,
+            .latency_ns = elapsed,
+            .entry_count = null,
+            .error_msg = try alloc.dupe(u8, "sqlite step failed"),
+        };
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    const vtable_instance = VectorStore.VTable{
+        .upsert = &implUpsert,
+        .search = &implSearch,
+        .delete = &implDelete,
+        .count = &implCount,
+        .health_check = &implHealthCheck,
         .deinit = &implDeinit,
     };
 };
@@ -635,8 +1073,8 @@ test "blob cosine similarity matches math cosine similarity" {
     defer std.testing.allocator.free(blob);
 
     const expected = vector.cosineSimilarity(&query, &emb);
-    const query_norm = SqliteSharedVectorStore.queryNorm(&query);
-    const actual = SqliteSharedVectorStore.cosineSimilarityBlob(&query, query_norm, blob);
+    const query_norm = queryNorm(&query);
+    const actual = cosineSimilarityBlob(&query, query_norm, blob);
     try std.testing.expect(@abs(expected - actual) < 0.0001);
 }
 
@@ -652,6 +1090,62 @@ test "search with zero limit returns empty" {
     const results = try s.search(std.testing.allocator, &[_]f32{ 1.0, 0.0, 0.0 }, 0);
     defer freeVectorResults(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "ann candidate limit respects multiplier and minimum" {
+    try std.testing.expectEqual(@as(u32, 0), annCandidateLimit(0, 12, 64));
+    try std.testing.expectEqual(@as(u32, 64), annCandidateLimit(1, 4, 64));
+    try std.testing.expectEqual(@as(u32, 120), annCandidateLimit(10, 12, 64));
+    try std.testing.expectEqual(@as(u32, 20), annCandidateLimit(10, 2, 5));
+}
+
+test "sqlite ann search falls back to exact when ann index has no candidates" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var shared = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer shared.deinit();
+    const shared_store = shared.store();
+    try shared_store.upsert("k_exact", &[_]f32{ 1.0, 0.0, 0.0 });
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 64);
+    defer ann.deinit();
+
+    // Simulate missing ANN coverage for existing rows.
+    var clear_stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(mem.db, "DELETE FROM memory_embedding_ann", -1, &clear_stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    defer _ = c.sqlite3_finalize(clear_stmt);
+    rc = c.sqlite3_step(clear_stmt);
+    try std.testing.expectEqual(c.SQLITE_DONE, rc);
+
+    const ann_store = ann.store();
+    const results = try ann_store.search(std.testing.allocator, &[_]f32{ 1.0, 0.0, 0.0 }, 1);
+    defer freeVectorResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("k_exact", results[0].key);
+    try std.testing.expect(results[0].score > 0.99);
+}
+
+test "sqlite ann upsert and search basic path" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 32);
+    defer ann.deinit();
+
+    const s = ann.store();
+    try s.upsert("exact", &[_]f32{ 1.0, 0.0, 0.0 });
+    try s.upsert("close", &[_]f32{ 0.9, 0.1, 0.0 });
+    try s.upsert("far", &[_]f32{ 0.0, 0.0, 1.0 });
+
+    const results = try s.search(std.testing.allocator, &[_]f32{ 1.0, 0.0, 0.0 }, 2);
+    defer freeVectorResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expect(results[0].score >= results[1].score);
+    try std.testing.expect(results[0].score > 0.9);
 }
 
 test "round-trip: upsert then search finds the key" {

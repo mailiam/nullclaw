@@ -845,6 +845,9 @@ pub const MemoryVectorStoreConfig = struct {
     qdrant_api_key: []const u8 = "",
     qdrant_collection: []const u8 = "nullclaw_memories",
     pgvector_table: []const u8 = "memory_embeddings",
+    // sqlite_ann (experimental): candidate prefilter tuning.
+    ann_candidate_multiplier: u32 = 12,
+    ann_min_candidates: u32 = 64,
 };
 
 pub const MemoryChunkingConfig = struct {

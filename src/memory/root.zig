@@ -397,7 +397,7 @@ pub const Memory = struct {
 pub const ResolvedConfig = struct {
     primary_backend: []const u8,
     retrieval_mode: []const u8, // "disabled" | "keyword" | "hybrid"
-    vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "qdrant" | "pgvector"
+    vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "sqlite_ann" | "qdrant" | "pgvector"
     embedding_provider: []const u8, // "none" | "openai" | "gemini" | "voyage" | "ollama" | "auto"
     rollout_mode: []const u8,
     vector_sync_mode: []const u8, // "best_effort" | "durable_outbox"
@@ -844,6 +844,7 @@ pub fn initRuntime(
         //    "pgvector"       → PgvectorVectorStore via libpq (requires enable_postgres)
         //    "sqlite_shared"  → explicit sqlite shared (requires sqlite-based primary)
         //    "sqlite_sidecar" → explicit sqlite sidecar (separate vectors.db)
+        //    "sqlite_ann"     → sqlite shared + ANN prefilter (experimental)
         var db_handle_for_outbox: ?*c.sqlite3 = null;
         const store_kind = config.search.store.kind;
 
@@ -892,50 +893,73 @@ pub fn initRuntime(
             break :vec_plane;
         } else {
             // auto / sqlite_shared / sqlite_sidecar
-            const use_shared = std.mem.eql(u8, store_kind, "auto") or std.mem.eql(u8, store_kind, "sqlite_shared");
-            if (use_shared) {
+            if (std.mem.eql(u8, store_kind, "sqlite_ann")) {
                 if (extractSqliteDb(instance.memory)) |db_handle| {
-                    // sqlite_shared: reuse existing sqlite db handle
-                    const vs = allocator.create(vector_store.SqliteSharedVectorStore) catch break :vec_plane;
-                    vs.* = vector_store.SqliteSharedVectorStore.init(allocator, db_handle);
+                    const vs = allocator.create(vector_store.SqliteAnnVectorStore) catch break :vec_plane;
+                    vs.* = vector_store.SqliteAnnVectorStore.init(
+                        allocator,
+                        db_handle,
+                        config.search.store.ann_candidate_multiplier,
+                        config.search.store.ann_min_candidates,
+                    ) catch |err| {
+                        allocator.destroy(vs);
+                        log.warn("sqlite_ann vector store init failed: {}", .{err});
+                        break :vec_plane;
+                    };
                     vs.owns_self = true;
                     vs_iface = vs.store();
                     db_handle_for_outbox = db_handle;
-                    resolved_vector_mode = "sqlite_shared";
-                } else if (std.mem.eql(u8, store_kind, "sqlite_shared")) {
-                    log.warn("vector store kind 'sqlite_shared' requires a sqlite-based primary backend", .{});
+                    resolved_vector_mode = "sqlite_ann";
+                } else {
+                    log.warn("vector store kind 'sqlite_ann' requires a sqlite-based primary backend", .{});
                     break :vec_plane;
                 }
-                // else: auto fallthrough to sidecar below
-            }
+            } else {
+                const use_shared = std.mem.eql(u8, store_kind, "auto") or std.mem.eql(u8, store_kind, "sqlite_shared");
+                if (use_shared) {
+                    if (extractSqliteDb(instance.memory)) |db_handle| {
+                        // sqlite_shared: reuse existing sqlite db handle
+                        const vs = allocator.create(vector_store.SqliteSharedVectorStore) catch break :vec_plane;
+                        vs.* = vector_store.SqliteSharedVectorStore.init(allocator, db_handle);
+                        vs.owns_self = true;
+                        vs_iface = vs.store();
+                        db_handle_for_outbox = db_handle;
+                        resolved_vector_mode = "sqlite_shared";
+                    } else if (std.mem.eql(u8, store_kind, "sqlite_shared")) {
+                        log.warn("vector store kind 'sqlite_shared' requires a sqlite-based primary backend", .{});
+                        break :vec_plane;
+                    }
+                    // else: auto fallthrough to sidecar below
+                }
 
-            // sqlite_sidecar: explicit or auto fallback for non-sqlite backends
-            if (vs_iface == null) {
-                const sidecar_path_slice = blk: {
-                    const configured = config.search.store.sidecar_path;
-                    if (configured.len == 0) {
-                        break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
-                    }
-                    if (std.fs.path.isAbsolute(configured)) {
-                        break :blk allocator.dupeZ(u8, configured) catch break :vec_plane;
-                    }
-                    break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, configured }) catch break :vec_plane;
-                };
-                const sidecar_path: [*:0]const u8 = sidecar_path_slice.ptr;
-                const vs = allocator.create(vector_store.SqliteSidecarVectorStore) catch {
-                    allocator.free(sidecar_path_slice);
-                    break :vec_plane;
-                };
-                vs.* = vector_store.SqliteSidecarVectorStore.init(allocator, sidecar_path) catch {
-                    allocator.destroy(vs);
-                    allocator.free(sidecar_path_slice);
-                    break :vec_plane;
-                };
-                vs.owns_self = true;
-                vs_iface = vs.store();
-                db_handle_for_outbox = vs.db; // sidecar's own db for outbox
-                sidecar_db_path = sidecar_path;
-                resolved_vector_mode = "sqlite_sidecar";
+                // sqlite_sidecar: explicit or auto fallback for non-sqlite backends
+                if (vs_iface == null) {
+                    const sidecar_path_slice = blk: {
+                        const configured = config.search.store.sidecar_path;
+                        if (configured.len == 0) {
+                            break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
+                        }
+                        if (std.fs.path.isAbsolute(configured)) {
+                            break :blk allocator.dupeZ(u8, configured) catch break :vec_plane;
+                        }
+                        break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, configured }) catch break :vec_plane;
+                    };
+                    const sidecar_path: [*:0]const u8 = sidecar_path_slice.ptr;
+                    const vs = allocator.create(vector_store.SqliteSidecarVectorStore) catch {
+                        allocator.free(sidecar_path_slice);
+                        break :vec_plane;
+                    };
+                    vs.* = vector_store.SqliteSidecarVectorStore.init(allocator, sidecar_path) catch {
+                        allocator.destroy(vs);
+                        allocator.free(sidecar_path_slice);
+                        break :vec_plane;
+                    };
+                    vs.owns_self = true;
+                    vs_iface = vs.store();
+                    db_handle_for_outbox = vs.db; // sidecar's own db for outbox
+                    sidecar_db_path = sidecar_path;
+                    resolved_vector_mode = "sqlite_sidecar";
+                }
             }
         }
 
@@ -1556,6 +1580,29 @@ test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
 
     try std.testing.expect(rt._vector_store != null);
     try std.testing.expectEqualStrings("sqlite_sidecar", rt.resolved.vector_mode);
+}
+
+test "initRuntime resolves sqlite_ann mode when explicitly configured" {
+    if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .store = .{
+                .kind = "sqlite_ann",
+                .ann_candidate_multiplier = 10,
+                .ann_min_candidates = 80,
+            },
+        },
+    }, ws.path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._vector_store != null);
+    try std.testing.expectEqualStrings("sqlite_ann", rt.resolved.vector_mode);
 }
 
 test "initRuntime uses configured relative sqlite_sidecar path" {

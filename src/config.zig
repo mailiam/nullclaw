@@ -1470,6 +1470,24 @@ test "json parse memory weights accept integer values" {
     try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.search.query.hybrid.text_weight);
 }
 
+test "json parse memory sqlite_ann store options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"memory":{"search":{"store":{"kind":"sqlite_ann","ann_candidate_multiplier":9,"ann_min_candidates":77}}}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("sqlite_ann", cfg.memory.search.store.kind);
+    try std.testing.expectEqual(@as(u32, 9), cfg.memory.search.store.ann_candidate_multiplier);
+    try std.testing.expectEqual(@as(u32, 77), cfg.memory.search.store.ann_min_candidates);
+}
+
 test "save roundtrip preserves extended config sections" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

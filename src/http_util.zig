@@ -195,6 +195,7 @@ fn curlRequestWithProxy(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
+            log.debug("curl {s} exited with code {d}", .{ method, code });
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },
@@ -421,6 +422,7 @@ fn curlGetWithProxyAndResolve(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
+            log.debug("curl GET exited with code {d} (timeout={s}s)", .{ code, timeout_secs });
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },

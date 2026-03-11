@@ -39,7 +39,10 @@ pub fn curlGet(
 
     return http_util.curlGet(allocator, url, headers, timeout_secs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.RequestFailed,
+        else => {
+            log.err("curl GET failed: {s} (timeout={s}s)", .{ @errorName(err), timeout_secs });
+            return error.RequestFailed;
+        },
     };
 }
 
@@ -54,7 +57,10 @@ pub fn curlPostJson(
 
     return http_util.curlPostWithProxy(allocator, url, body, headers, null, timeout_secs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.RequestFailed,
+        else => {
+            log.err("curl POST failed: {s} (timeout={s}s)", .{ @errorName(err), timeout_secs });
+            return error.RequestFailed;
+        },
     };
 }
 

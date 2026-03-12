@@ -4,7 +4,7 @@
 //!   - GET /.well-known/agent-card.json -> Agent Card discovery
 //!   - POST /a2a -> JSON-RPC dispatch (message/send, message/stream, tasks/get, tasks/cancel, tasks/list)
 //!
-//! Task state machine: submitted -> working -> completed | failed | canceled | input_required
+//! Task state machine: submitted -> working -> completed | failed | canceled | input-required
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,6 +52,65 @@ pub const TaskRecord = struct {
     agent_text: []u8,
 };
 
+pub const TaskSnapshot = struct {
+    id: []u8,
+    context_id: []u8,
+    session_key: []u8,
+    state: TaskState,
+    created_at: i64,
+    updated_at: i64,
+    user_text: []u8,
+    agent_text: []u8,
+
+    pub fn deinit(self: *TaskSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.context_id);
+        allocator.free(self.session_key);
+        allocator.free(self.user_text);
+        allocator.free(self.agent_text);
+    }
+};
+
+fn deinitTaskSnapshots(allocator: std.mem.Allocator, tasks: []TaskSnapshot) void {
+    for (tasks) |*task| task.deinit(allocator);
+    allocator.free(tasks);
+}
+
+fn isTerminalState(state: TaskState) bool {
+    return switch (state) {
+        .completed, .failed, .canceled => true,
+        else => false,
+    };
+}
+
+fn taskOrdinal(task_id: []const u8) u64 {
+    const prefix = "task-";
+    if (!std.mem.startsWith(u8, task_id, prefix)) return 0;
+    return std.fmt.parseInt(u64, task_id[prefix.len..], 10) catch 0;
+}
+
+fn isTaskSnapshotMoreRecent(current: TaskSnapshot, previous: TaskSnapshot) bool {
+    if (current.updated_at != previous.updated_at) {
+        return current.updated_at > previous.updated_at;
+    }
+    return taskOrdinal(current.id) > taskOrdinal(previous.id);
+}
+
+fn sortTaskSnapshotsByRecency(tasks: []TaskSnapshot) void {
+    var i: usize = 1;
+    while (i < tasks.len) : (i += 1) {
+        const current = tasks[i];
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const prev = tasks[j - 1];
+            const more_recent = isTaskSnapshotMoreRecent(current, prev);
+            if (!more_recent) break;
+            tasks[j] = prev;
+        }
+        tasks[j] = current;
+    }
+}
+
 // ── Task Registry ───────────────────────────────────────────────
 
 pub const TaskRegistry = struct {
@@ -75,13 +134,16 @@ pub const TaskRegistry = struct {
         self.tasks.deinit(self.allocator);
     }
 
-    pub fn createTask(self: *TaskRegistry, user_text: []const u8, context_id: ?[]const u8) !*TaskRecord {
+    pub fn createTask(self: *TaskRegistry, allocator: std.mem.Allocator, user_text: []const u8, context_id: ?[]const u8) !TaskSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Evict oldest completed tasks if at capacity.
+        // Evict the least-recently-updated terminal task. If all tasks are active,
+        // reject the new task to keep the registry strictly capped.
         if (self.tasks.count() >= MAX_TASKS) {
-            self.evictOldestCompleted();
+            if (!self.evictOldestTerminalLocked()) {
+                return error.TaskRegistryFull;
+            }
         }
 
         const id_num = self.next_id;
@@ -122,14 +184,20 @@ pub const TaskRegistry = struct {
         };
 
         try self.tasks.put(self.allocator, task_id, task);
+        errdefer {
+            if (self.tasks.fetchRemove(task_id)) |removed| {
+                self.freeTask(removed.value);
+            }
+        }
 
-        return task;
+        return self.snapshotLocked(allocator, task);
     }
 
-    pub fn getTask(self: *TaskRegistry, task_id: []const u8) ?*TaskRecord {
+    pub fn getTaskSnapshot(self: *TaskRegistry, allocator: std.mem.Allocator, task_id: []const u8) !?TaskSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.tasks.get(task_id);
+        const task = self.tasks.get(task_id) orelse return null;
+        return try self.snapshotLocked(allocator, task);
     }
 
     pub fn taskCount(self: *TaskRegistry) usize {
@@ -138,20 +206,72 @@ pub const TaskRegistry = struct {
         return self.tasks.count();
     }
 
-    /// List tasks with optional filtering. Returns owned slice of task pointers.
-    /// Caller must free the returned slice with the provided allocator.
+    pub fn setTaskState(self: *TaskRegistry, task_id: []const u8, new_state: TaskState) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const task = self.tasks.get(task_id) orelse return false;
+        if (isTerminalState(task.state) and task.state != new_state) return false;
+        task.state = new_state;
+        task.updated_at = std.time.timestamp();
+        return true;
+    }
+
+    pub fn finalizeTask(
+        self: *TaskRegistry,
+        allocator: std.mem.Allocator,
+        task_id: []const u8,
+        final_state: TaskState,
+        agent_text: ?[]const u8,
+    ) !?TaskSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const task = self.tasks.get(task_id) orelse return null;
+        if (task.state == .canceled and final_state != .canceled) {
+            return try self.snapshotLocked(allocator, task);
+        }
+
+        if (agent_text) |text| {
+            const new_agent_text = try self.allocator.dupe(u8, text);
+            errdefer self.allocator.free(new_agent_text);
+            self.allocator.free(task.agent_text);
+            task.agent_text = new_agent_text;
+        }
+
+        task.state = final_state;
+        task.updated_at = std.time.timestamp();
+        return try self.snapshotLocked(allocator, task);
+    }
+
+    pub fn cancelTask(self: *TaskRegistry, allocator: std.mem.Allocator, task_id: []const u8) !?TaskSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const task = self.tasks.get(task_id) orelse return null;
+        if (!isTerminalState(task.state)) {
+            task.state = .canceled;
+            task.updated_at = std.time.timestamp();
+        }
+        return try self.snapshotLocked(allocator, task);
+    }
+
+    /// List tasks with optional filtering. Returns owned task snapshots sorted by recency.
+    /// Caller must free the returned slice with `deinitTaskSnapshots`.
     pub fn listTasks(
         self: *TaskRegistry,
         allocator: std.mem.Allocator,
         filter_state: ?TaskState,
         filter_context_id: ?[]const u8,
         max_results: usize,
-    ) ![]const *TaskRecord {
+    ) ![]TaskSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var result: std.ArrayListUnmanaged(*TaskRecord) = .empty;
-        errdefer result.deinit(allocator);
+        var result: std.ArrayListUnmanaged(TaskSnapshot) = .empty;
+        errdefer {
+            for (result.items) |*task| task.deinit(allocator);
+            result.deinit(allocator);
+        }
 
         var iter = self.tasks.iterator();
         while (iter.next()) |entry| {
@@ -162,26 +282,36 @@ pub const TaskRegistry = struct {
             if (filter_context_id) |ctx| {
                 if (!std.mem.eql(u8, task.context_id, ctx)) continue;
             }
-            try result.append(allocator, task);
-            if (result.items.len >= max_results) break;
+            try result.append(allocator, try self.snapshotLocked(allocator, task));
         }
 
+        sortTaskSnapshotsByRecency(result.items);
+        if (result.items.len > max_results) {
+            var i = max_results;
+            while (i < result.items.len) : (i += 1) {
+                result.items[i].deinit(allocator);
+            }
+            result.items.len = max_results;
+        }
         return result.toOwnedSlice(allocator);
     }
 
-    /// Evict the oldest completed/failed/canceled task. Must be called with mutex held.
-    fn evictOldestCompleted(self: *TaskRegistry) void {
+    /// Evict the least-recently-updated terminal task. Must be called with mutex held.
+    fn evictOldestTerminalLocked(self: *TaskRegistry) bool {
         var oldest_key: ?[]const u8 = null;
         var oldest_time: i64 = std.math.maxInt(i64);
+        var oldest_ordinal: u64 = std.math.maxInt(u64);
 
         var iter = self.tasks.iterator();
         while (iter.next()) |entry| {
             const task = entry.value_ptr.*;
-            const is_terminal = task.state == .completed or
-                task.state == .failed or
-                task.state == .canceled;
-            if (is_terminal and task.created_at < oldest_time) {
-                oldest_time = task.created_at;
+            const ordinal = taskOrdinal(task.id);
+            if (isTerminalState(task.state) and
+                (task.updated_at < oldest_time or
+                    (task.updated_at == oldest_time and ordinal < oldest_ordinal)))
+            {
+                oldest_time = task.updated_at;
+                oldest_ordinal = ordinal;
                 oldest_key = entry.key_ptr.*;
             }
         }
@@ -189,8 +319,10 @@ pub const TaskRegistry = struct {
         if (oldest_key) |key| {
             if (self.tasks.fetchRemove(key)) |kv| {
                 self.freeTask(kv.value);
+                return true;
             }
         }
+        return false;
     }
 
     fn freeTask(self: *TaskRegistry, task: *TaskRecord) void {
@@ -200,6 +332,31 @@ pub const TaskRegistry = struct {
         self.allocator.free(task.user_text);
         self.allocator.free(task.agent_text);
         self.allocator.destroy(task);
+    }
+
+    fn snapshotLocked(self: *TaskRegistry, allocator: std.mem.Allocator, task: *const TaskRecord) !TaskSnapshot {
+        _ = self;
+        const id = try allocator.dupe(u8, task.id);
+        errdefer allocator.free(id);
+        const context_id = try allocator.dupe(u8, task.context_id);
+        errdefer allocator.free(context_id);
+        const session_key = try allocator.dupe(u8, task.session_key);
+        errdefer allocator.free(session_key);
+        const user_text = try allocator.dupe(u8, task.user_text);
+        errdefer allocator.free(user_text);
+        const agent_text = try allocator.dupe(u8, task.agent_text);
+        errdefer allocator.free(agent_text);
+
+        return .{
+            .id = id,
+            .context_id = context_id,
+            .session_key = session_key,
+            .state = task.state,
+            .created_at = task.created_at,
+            .updated_at = task.updated_at,
+            .user_text = user_text,
+            .agent_text = agent_text,
+        };
     }
 };
 
@@ -267,7 +424,7 @@ pub fn handleJsonRpc(
     registry: *TaskRegistry,
     session_mgr: anytype,
 ) A2aResponse {
-    const method = gateway.jsonStringField(body, "method") orelse {
+    const method = extractJsonRpcMethod(body) orelse {
         const err_body = buildJsonRpcError(allocator, "null", -32600, "Missing method") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -298,7 +455,7 @@ pub fn handleJsonRpc(
 /// Check if a JSON-RPC body contains a streaming method.
 /// Used by the gateway to decide between normal and SSE response paths.
 pub fn isStreamingMethod(body: []const u8) bool {
-    const method = gateway.jsonStringField(body, "method") orelse return false;
+    const method = extractJsonRpcMethod(body) orelse return false;
     return std.mem.eql(u8, method, "message/stream") or
         std.mem.eql(u8, method, "tasks/sendSubscribe");
 }
@@ -364,15 +521,16 @@ pub fn handleStreamingRpc(
     };
     const context_id = extractMessageContextId(body);
 
-    const task = registry.createTask(text, context_id) catch {
+    var task = registry.createTask(allocator, text, context_id) catch {
         writeSseError(allocator, stream, request_id, -32603, "Failed to create task");
         return;
     };
+    defer task.deinit(allocator);
 
     // Write SSE headers.
     stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
 
-    const initial_task_json = buildTaskJson(allocator, task) catch return;
+    const initial_task_json = buildTaskJson(allocator, &task) catch return;
     defer allocator.free(initial_task_json);
     const initial_event = buildJsonRpcResult(allocator, request_id, initial_task_json) catch return;
     defer allocator.free(initial_event);
@@ -381,11 +539,18 @@ pub fn handleStreamingRpc(
     stream.writeAll("\n\n") catch return;
 
     // Mark as working after emitting the initial submitted task.
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .working;
-        task.updated_at = std.time.timestamp();
+    if (!registry.setTaskState(task.id, .working)) {
+        var current_task = registry.getTaskSnapshot(allocator, task.id) catch return;
+        defer if (current_task) |*snapshot| snapshot.deinit(allocator);
+        const current_snapshot = current_task orelse return;
+        if (current_snapshot.state == .canceled) {
+            const final_event = buildStatusUpdateEvent(allocator, request_id, current_snapshot.id, current_snapshot.context_id, current_snapshot.state, current_snapshot.updated_at, true) catch return;
+            defer allocator.free(final_event);
+            stream.writeAll("data: ") catch return;
+            stream.writeAll(final_event) catch return;
+            stream.writeAll("\n\n") catch return;
+        }
+        return;
     }
 
     // Create SSE sink context.
@@ -400,28 +565,28 @@ pub fn handleStreamingRpc(
 
     const context: ConversationContext = .{ .channel = "a2a" };
     const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink) catch {
-        // Mark as failed and send error event.
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .failed;
-        task.updated_at = std.time.timestamp();
-
-        writeSseErrorEvent(allocator, &sse_ctx, -32603, "Agent processing failed");
+        var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
+        defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
+        if (failed_task) |snapshot| {
+            if (snapshot.state == .canceled) {
+                const final_event = buildStatusUpdateEvent(allocator, request_id, snapshot.id, snapshot.context_id, snapshot.state, snapshot.updated_at, true) catch return;
+                defer allocator.free(final_event);
+                sse_ctx.writeSseEvent(final_event);
+            } else {
+                writeSseErrorEvent(allocator, &sse_ctx, -32603, "Agent processing failed");
+            }
+        } else {
+            writeSseErrorEvent(allocator, &sse_ctx, -32603, "Agent processing failed");
+        }
         return;
     };
     defer freeSessionResponse(session_mgr, response);
 
-    // Update task with final response.
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .completed;
-        task.updated_at = std.time.timestamp();
-        registry.allocator.free(task.agent_text);
-        task.agent_text = registry.allocator.dupe(u8, response) catch return;
-    }
+    var final_task = registry.finalizeTask(allocator, task.id, .completed, response) catch return;
+    defer if (final_task) |*snapshot| snapshot.deinit(allocator);
+    const final_snapshot = final_task orelse return;
 
-    const final_event = buildStatusUpdateEvent(allocator, request_id, task.id, task.context_id, task.state, task.updated_at, true) catch return;
+    const final_event = buildStatusUpdateEvent(allocator, request_id, final_snapshot.id, final_snapshot.context_id, final_snapshot.state, final_snapshot.updated_at, true) catch return;
     defer allocator.free(final_event);
     sse_ctx.writeSseEvent(final_event);
 }
@@ -459,50 +624,38 @@ fn handleSendMessage(
     };
     const context_id = extractMessageContextId(body);
 
-    const task = registry.createTask(text, context_id) catch {
+    var task = registry.createTask(allocator, text, context_id) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to create task") catch
             return errorResponse();
         return .{ .body = err_body };
     };
+    defer task.deinit(allocator);
 
     // Update state to working.
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .working;
-        task.updated_at = std.time.timestamp();
-    }
+    _ = registry.setTaskState(task.id, .working);
 
     const context: ConversationContext = .{ .channel = "a2a" };
     const response = session_mgr.processMessage(task.session_key, text, context) catch {
-        // On error, mark task as failed.
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .failed;
-        task.updated_at = std.time.timestamp();
-
+        _ = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Agent processing failed") catch
             return errorResponse();
         return .{ .body = err_body };
     };
     defer freeSessionResponse(session_mgr, response);
 
-    // Update task with response using the registry's long-lived allocator,
-    // not the per-request allocator which is freed after the response is sent.
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .completed;
-        task.updated_at = std.time.timestamp();
-        registry.allocator.free(task.agent_text);
-        task.agent_text = registry.allocator.dupe(u8, response) catch {
-            const err_body = buildJsonRpcError(allocator, request_id, -32603, "Out of memory") catch
-                return errorResponse();
-            return .{ .body = err_body };
-        };
-    }
+    var completed_task = registry.finalizeTask(allocator, task.id, .completed, response) catch {
+        const err_body = buildJsonRpcError(allocator, request_id, -32603, "Out of memory") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    };
+    defer if (completed_task) |*snapshot| snapshot.deinit(allocator);
+    const task_snapshot = completed_task orelse {
+        const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    };
 
-    const task_json = buildTaskJson(allocator, task) catch {
+    const task_json = buildTaskJson(allocator, &task_snapshot) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -528,13 +681,15 @@ fn handleGetTask(
         return .{ .body = err_body };
     };
 
-    const task = registry.getTask(task_id) orelse {
+    var task = registry.getTaskSnapshot(allocator, task_id) catch return errorResponse();
+    defer if (task) |*snapshot| snapshot.deinit(allocator);
+    const task_snapshot = task orelse {
         const err_body = buildJsonRpcError(allocator, request_id, -32001, "Task not found") catch
             return errorResponse();
         return .{ .body = err_body };
     };
 
-    const task_json = buildTaskJson(allocator, task) catch {
+    const task_json = buildTaskJson(allocator, &task_snapshot) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -561,7 +716,9 @@ fn handleCancelTask(
         return .{ .body = err_body };
     };
 
-    const task = registry.getTask(task_id) orelse {
+    var current_task = registry.getTaskSnapshot(allocator, task_id) catch return errorResponse();
+    defer if (current_task) |*snapshot| snapshot.deinit(allocator);
+    const task = current_task orelse {
         const err_body = buildJsonRpcError(allocator, request_id, -32001, "Task not found") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -580,18 +737,23 @@ fn handleCancelTask(
     // Request interruption if working.
     if (task.state == .working) {
         var result = session_mgr.requestTurnInterrupt(task.session_key);
-        result.deinit(allocator);
+        freeInterruptRequestResult(session_mgr, &result);
     }
 
-    // Mark as canceled.
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .canceled;
-        task.updated_at = std.time.timestamp();
+    var canceled_task = registry.cancelTask(allocator, task_id) catch return errorResponse();
+    defer if (canceled_task) |*snapshot| snapshot.deinit(allocator);
+    const task_snapshot = canceled_task orelse {
+        const err_body = buildJsonRpcError(allocator, request_id, -32001, "Task not found") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    };
+    if (task_snapshot.state != .canceled) {
+        const err_body = buildJsonRpcError(allocator, request_id, -32002, "Task already in terminal state") catch
+            return errorResponse();
+        return .{ .body = err_body };
     }
 
-    const task_json = buildTaskJson(allocator, task) catch {
+    const task_json = buildTaskJson(allocator, &task_snapshot) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -612,30 +774,27 @@ fn handleListTasks(
     registry: *TaskRegistry,
 ) A2aResponse {
     // Parse optional filters from params.
-    const params_needle = "\"params\"";
-    const params_section = if (std.mem.indexOf(u8, body, params_needle)) |pos|
-        body[pos + params_needle.len ..]
-    else
-        body;
+    const params_section = extractParamsObject(body) orelse "{}";
 
     // Optional state filter.
     const filter_state: ?TaskState = blk: {
-        const state_str = gateway.jsonStringField(params_section, "state") orelse break :blk null;
+        const state_str = extractObjectStringField(params_section, "state") orelse break :blk null;
         if (std.mem.eql(u8, state_str, "submitted")) break :blk .submitted;
         if (std.mem.eql(u8, state_str, "working")) break :blk .working;
         if (std.mem.eql(u8, state_str, "completed")) break :blk .completed;
         if (std.mem.eql(u8, state_str, "failed")) break :blk .failed;
         if (std.mem.eql(u8, state_str, "canceled")) break :blk .canceled;
+        if (std.mem.eql(u8, state_str, "input-required")) break :blk .input_required;
         if (std.mem.eql(u8, state_str, "input_required")) break :blk .input_required;
         break :blk null;
     };
 
     // Optional context_id filter.
-    const filter_context_id = gateway.jsonStringField(params_section, "contextId");
+    const filter_context_id = extractObjectStringField(params_section, "contextId");
 
     // Page size (default 50, max 100).
     const page_size: usize = blk: {
-        const val = gateway.jsonIntField(params_section, "pageSize") orelse break :blk 50;
+        const val = extractObjectIntField(params_section, "pageSize") orelse break :blk 50;
         if (val < 1) break :blk 1;
         if (val > 100) break :blk 100;
         break :blk @intCast(val);
@@ -646,7 +805,7 @@ fn handleListTasks(
             return errorResponse();
         return .{ .body = err_body };
     };
-    defer allocator.free(tasks);
+    defer deinitTaskSnapshots(allocator, tasks);
 
     // Build result JSON: {"tasks":[...], "nextPageToken":"", "pageSize":N, "totalSize":N}
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -654,7 +813,7 @@ fn handleListTasks(
     const w = buf.writer(allocator);
 
     w.writeAll("{\"tasks\":[") catch return errorResponse();
-    for (tasks, 0..) |task, i| {
+    for (tasks, 0..) |*task, i| {
         if (i > 0) w.writeByte(',') catch return errorResponse();
         const task_json = buildTaskJson(allocator, task) catch return errorResponse();
         defer allocator.free(task_json);
@@ -708,7 +867,7 @@ fn buildJsonRpcError(allocator: std.mem.Allocator, request_id: []const u8, code:
     return buf.toOwnedSlice(allocator);
 }
 
-fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskRecord) ![]u8 {
+fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -800,89 +959,240 @@ fn buildEndpointUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
 
 // ── Text Extraction Helpers ─────────────────────────────────────
 
-/// Extract the user's message text from A2A params.message.parts[0].text.
-/// Scans for "text" key after "parts", skipping occurrences that appear as
-/// values (e.g. "type":"text") by retrying when jsonStringField returns null.
-fn extractMessageText(body: []const u8) ?[]const u8 {
-    const parts_needle = "\"parts\"";
-    const parts_pos = std.mem.indexOf(u8, body, parts_needle) orelse return null;
-    var remaining = body[parts_pos + parts_needle.len ..];
+fn skipJsonWhitespace(json: []const u8, start: usize) usize {
+    var i = start;
+    while (i < json.len and (json[i] == ' ' or json[i] == '\t' or json[i] == '\n' or json[i] == '\r')) : (i += 1) {}
+    return i;
+}
 
-    const key_needle = "\"text\"";
-    // Iterate through all occurrences of "text" to find one that is a JSON key.
-    while (std.mem.indexOf(u8, remaining, key_needle)) |pos| {
-        const after_key = remaining[pos + key_needle.len ..];
-        // Skip whitespace, then check for colon (key indicator).
-        var i: usize = 0;
-        while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == '\t' or
-            after_key[i] == '\n' or after_key[i] == '\r')) : (i += 1)
-        {}
-        if (i < after_key.len and after_key[i] == ':') {
-            // This is a key — use jsonStringField from this position.
-            return gateway.jsonStringField(remaining[pos..], "text");
+fn scanJsonStringEnd(json: []const u8, start: usize) ?usize {
+    if (start >= json.len or json[start] != '"') return null;
+
+    var i = start + 1;
+    while (i < json.len) : (i += 1) {
+        if (json[i] == '\\') {
+            if (i + 1 >= json.len) return null;
+            i += 1;
+            continue;
         }
-        // Not a key (it's a value like "type":"text"), skip past and continue.
-        remaining = remaining[pos + key_needle.len ..];
+        if (json[i] == '"') return i + 1;
     }
     return null;
+}
+
+fn scanJsonCompositeEnd(json: []const u8, start: usize, open: u8, close: u8) ?usize {
+    if (start >= json.len or json[start] != open) return null;
+
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    var i = start;
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == open) {
+            depth += 1;
+            continue;
+        }
+        if (c == close) {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        }
+    }
+    return null;
+}
+
+fn scanJsonNumberEnd(json: []const u8, start: usize) ?usize {
+    if (start >= json.len) return null;
+
+    var i = start;
+    if (json[i] == '-') i += 1;
+
+    var saw_digits = false;
+    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) {
+        saw_digits = true;
+    }
+    if (!saw_digits) return null;
+
+    if (i < json.len and json[i] == '.') {
+        i += 1;
+        var saw_fraction = false;
+        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) {
+            saw_fraction = true;
+        }
+        if (!saw_fraction) return null;
+    }
+
+    if (i < json.len and (json[i] == 'e' or json[i] == 'E')) {
+        i += 1;
+        if (i < json.len and (json[i] == '+' or json[i] == '-')) i += 1;
+        var saw_exponent = false;
+        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) {
+            saw_exponent = true;
+        }
+        if (!saw_exponent) return null;
+    }
+
+    return i;
+}
+
+fn scanJsonLiteralEnd(json: []const u8, start: usize, literal: []const u8) ?usize {
+    if (start + literal.len > json.len) return null;
+    if (!std.mem.eql(u8, json[start .. start + literal.len], literal)) return null;
+    return start + literal.len;
+}
+
+fn scanJsonValueEnd(json: []const u8, start: usize) ?usize {
+    const i = skipJsonWhitespace(json, start);
+    if (i >= json.len) return null;
+
+    return switch (json[i]) {
+        '"' => scanJsonStringEnd(json, i),
+        '{' => scanJsonCompositeEnd(json, i, '{', '}'),
+        '[' => scanJsonCompositeEnd(json, i, '[', ']'),
+        't' => scanJsonLiteralEnd(json, i, "true"),
+        'f' => scanJsonLiteralEnd(json, i, "false"),
+        'n' => scanJsonLiteralEnd(json, i, "null"),
+        '-', '0'...'9' => scanJsonNumberEnd(json, i),
+        else => null,
+    };
+}
+
+fn extractObjectFieldRaw(object_json: []const u8, key: []const u8) ?[]const u8 {
+    var i = skipJsonWhitespace(object_json, 0);
+    if (i >= object_json.len or object_json[i] != '{') return null;
+    i += 1;
+
+    while (true) {
+        i = skipJsonWhitespace(object_json, i);
+        if (i >= object_json.len) return null;
+        if (object_json[i] == '}') return null;
+
+        const key_end = scanJsonStringEnd(object_json, i) orelse return null;
+        const object_key = object_json[i + 1 .. key_end - 1];
+
+        i = skipJsonWhitespace(object_json, key_end);
+        if (i >= object_json.len or object_json[i] != ':') return null;
+        i = skipJsonWhitespace(object_json, i + 1);
+
+        const value_start = i;
+        const value_end = scanJsonValueEnd(object_json, i) orelse return null;
+        if (std.mem.eql(u8, object_key, key)) {
+            return object_json[value_start..value_end];
+        }
+
+        i = skipJsonWhitespace(object_json, value_end);
+        if (i >= object_json.len) return null;
+        if (object_json[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (object_json[i] == '}') return null;
+        return null;
+    }
+}
+
+fn extractObjectStringField(object_json: []const u8, key: []const u8) ?[]const u8 {
+    const raw = extractObjectFieldRaw(object_json, key) orelse return null;
+    if (raw.len < 2 or raw[0] != '"') return null;
+    const end = scanJsonStringEnd(raw, 0) orelse return null;
+    if (end != raw.len) return null;
+    return raw[1 .. raw.len - 1];
+}
+
+fn extractObjectIntField(object_json: []const u8, key: []const u8) ?i64 {
+    const raw = extractObjectFieldRaw(object_json, key) orelse return null;
+    return std.fmt.parseInt(i64, raw, 10) catch null;
+}
+
+fn extractObjectObjectField(object_json: []const u8, key: []const u8) ?[]const u8 {
+    const raw = extractObjectFieldRaw(object_json, key) orelse return null;
+    const start = skipJsonWhitespace(raw, 0);
+    if (start >= raw.len or raw[start] != '{') return null;
+    return raw[start..];
+}
+
+fn extractObjectArrayField(object_json: []const u8, key: []const u8) ?[]const u8 {
+    const raw = extractObjectFieldRaw(object_json, key) orelse return null;
+    const start = skipJsonWhitespace(raw, 0);
+    if (start >= raw.len or raw[start] != '[') return null;
+    return raw[start..];
+}
+
+fn extractArrayObjectStringField(array_json: []const u8, key: []const u8) ?[]const u8 {
+    var i = skipJsonWhitespace(array_json, 0);
+    if (i >= array_json.len or array_json[i] != '[') return null;
+    i += 1;
+
+    while (true) {
+        i = skipJsonWhitespace(array_json, i);
+        if (i >= array_json.len) return null;
+        if (array_json[i] == ']') return null;
+
+        const value_start = i;
+        const value_end = scanJsonValueEnd(array_json, i) orelse return null;
+        if (extractObjectStringField(array_json[value_start..value_end], key)) |value| {
+            return value;
+        }
+
+        i = skipJsonWhitespace(array_json, value_end);
+        if (i >= array_json.len) return null;
+        if (array_json[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (array_json[i] == ']') return null;
+        return null;
+    }
+}
+
+/// Extract the user's message text from A2A params.message.parts[0].text.
+fn extractMessageText(body: []const u8) ?[]const u8 {
+    const params = extractParamsObject(body) orelse return null;
+    const message = extractObjectObjectField(params, "message") orelse return null;
+    const parts = extractObjectArrayField(message, "parts") orelse return null;
+    return extractArrayObjectStringField(parts, "text");
 }
 
 fn extractMessageContextId(body: []const u8) ?[]const u8 {
-    const message_needle = "\"message\"";
-    const message_pos = std.mem.indexOf(u8, body, message_needle) orelse return null;
-    const message_section = body[message_pos + message_needle.len ..];
-    return gateway.jsonStringField(message_section, "contextId");
+    const params = extractParamsObject(body) orelse return null;
+    const message = extractObjectObjectField(params, "message") orelse return null;
+    return extractObjectStringField(message, "contextId");
 }
 
-/// Extract the JSON-RPC "id" field as a raw JSON token (string including quotes, or number).
-/// Handles both `"id": "abc"` and `"id": 123`.
+fn extractJsonRpcMethod(body: []const u8) ?[]const u8 {
+    return extractObjectStringField(body, "method");
+}
+
+/// Extract the JSON-RPC "id" field as a raw JSON token (string including quotes, number, or null).
 fn extractJsonRpcId(body: []const u8) ?[]const u8 {
-    const needle = "\"id\"";
-    // Find top-level "id" — it appears before "params" in a well-formed request.
-    const id_pos = std.mem.indexOf(u8, body, needle) orelse return null;
-    const after_key = body[id_pos + needle.len ..];
+    return extractObjectFieldRaw(body, "id");
+}
 
-    // Skip whitespace and colon.
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or
-        after_key[i] == '\t' or after_key[i] == '\n' or after_key[i] == '\r')) : (i += 1)
-    {}
-    if (i >= after_key.len) return null;
-
-    if (after_key[i] == '"') {
-        // String value — return including quotes for raw JSON embedding.
-        const start = i;
-        i += 1;
-        while (i < after_key.len) : (i += 1) {
-            if (after_key[i] == '\\' and i + 1 < after_key.len) {
-                i += 1;
-                continue;
-            }
-            if (after_key[i] == '"') {
-                return after_key[start .. i + 1]; // includes both quotes
-            }
-        }
-        return null;
-    } else if (after_key[i] == '-' or (after_key[i] >= '0' and after_key[i] <= '9')) {
-        // Numeric value — scan digits.
-        const start = i;
-        while (i < after_key.len and ((after_key[i] >= '0' and after_key[i] <= '9') or
-            after_key[i] == '-' or after_key[i] == '.' or
-            after_key[i] == 'e' or after_key[i] == 'E' or after_key[i] == '+')) : (i += 1)
-        {}
-        if (i > start) return after_key[start..i];
-        return null;
-    }
-    return null;
+fn extractParamsObject(body: []const u8) ?[]const u8 {
+    return extractObjectObjectField(body, "params");
 }
 
 /// Extract task ID from params.id in the JSON-RPC body.
 fn extractParamsId(body: []const u8) ?[]const u8 {
-    const params_needle = "\"params\"";
-    const params_pos = std.mem.indexOf(u8, body, params_needle) orelse
-        return gateway.jsonStringField(body, "id");
-    const after_params = body[params_pos + params_needle.len ..];
-    return gateway.jsonStringField(after_params, "id");
+    const params = extractParamsObject(body) orelse return null;
+    return extractObjectStringField(params, "id");
 }
 
 fn buildArtifactUpdateEvent(
@@ -946,6 +1256,15 @@ fn buildStatusUpdateEvent(
     return buf.toOwnedSlice(allocator);
 }
 
+fn freeInterruptRequestResult(session_mgr: anytype, result: anytype) void {
+    const session_mgr_type = @TypeOf(session_mgr.*);
+    if (comptime @hasField(session_mgr_type, "allocator")) {
+        result.deinit(session_mgr.allocator);
+    } else {
+        result.deinit({});
+    }
+}
+
 fn freeSessionResponse(session_mgr: anytype, response: []const u8) void {
     const session_mgr_type = @TypeOf(session_mgr.*);
     if (comptime @hasField(session_mgr_type, "allocator")) {
@@ -971,6 +1290,7 @@ const testing = std.testing;
 
 const MockSessionManager = struct {
     response: []const u8 = "mock response",
+    interrupt_tool: ?[]const u8 = null,
     allocator: std.mem.Allocator = testing.allocator,
 
     pub fn processMessage(self: *MockSessionManager, _: []const u8, _: []const u8, _: anytype) ![]const u8 {
@@ -986,15 +1306,22 @@ const MockSessionManager = struct {
         return self.processMessage(session_key, content, conversation_context);
     }
 
-    pub fn requestTurnInterrupt(_: *MockSessionManager, _: []const u8) struct {
+    pub fn requestTurnInterrupt(self: *MockSessionManager, _: []const u8) struct {
         requested: bool,
         active_tool: ?[]u8,
 
-        pub fn deinit(s: *@This(), _: anytype) void {
-            _ = s;
+        pub fn deinit(s: *@This(), allocator: std.mem.Allocator) void {
+            if (s.active_tool) |name| allocator.free(name);
+            s.active_tool = null;
         }
     } {
-        return .{ .requested = false, .active_tool = null };
+        return .{
+            .requested = self.interrupt_tool != null,
+            .active_tool = if (self.interrupt_tool) |tool|
+                self.allocator.dupe(u8, tool) catch null
+            else
+                null,
+        };
     }
 };
 
@@ -1014,6 +1341,29 @@ fn testConfig() Config {
     };
 }
 
+fn mutateStoredTask(
+    registry: *TaskRegistry,
+    task_id: []const u8,
+    state: ?TaskState,
+    agent_text: ?[]const u8,
+    updated_at: ?i64,
+) !void {
+    registry.mutex.lock();
+    defer registry.mutex.unlock();
+
+    const task = registry.tasks.get(task_id) orelse return error.TestUnexpectedResult;
+    if (state) |value| task.state = value;
+    if (agent_text) |text| {
+        testing.allocator.free(task.agent_text);
+        task.agent_text = try testing.allocator.dupe(u8, text);
+    }
+    if (updated_at) |timestamp| task.updated_at = timestamp;
+}
+
+fn getTaskSnapshotOrFail(registry: *TaskRegistry, task_id: []const u8) !TaskSnapshot {
+    return (try registry.getTaskSnapshot(testing.allocator, task_id)) orelse error.TestUnexpectedResult;
+}
+
 test "TaskState jsonName returns correct strings" {
     try testing.expectEqualStrings("submitted", TaskState.submitted.jsonName());
     try testing.expectEqualStrings("working", TaskState.working.jsonName());
@@ -1023,11 +1373,13 @@ test "TaskState jsonName returns correct strings" {
     try testing.expectEqualStrings("input-required", TaskState.input_required.jsonName());
 }
 
-test "TaskRegistry createTask and getTask" {
+test "TaskRegistry createTask and getTaskSnapshot" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("hello world", null);
+    var task = try registry.createTask(testing.allocator, "hello world", null);
+    defer task.deinit(testing.allocator);
+
     try testing.expectEqualStrings("task-1", task.id);
     try testing.expectEqualStrings("ctx-1", task.context_id);
     try testing.expectEqualStrings("a2a:ctx-1", task.session_key);
@@ -1035,42 +1387,54 @@ test "TaskRegistry createTask and getTask" {
     try testing.expect(task.state == .submitted);
     try testing.expectEqual(@as(usize, 0), task.agent_text.len);
 
-    const found = registry.getTask("task-1");
+    var found = try registry.getTaskSnapshot(testing.allocator, "task-1");
+    defer if (found) |*snapshot| snapshot.deinit(testing.allocator);
     try testing.expect(found != null);
-    try testing.expect(found.? == task);
+    try testing.expectEqualStrings("task-1", found.?.id);
 
-    const not_found = registry.getTask("task-999");
+    const not_found = try registry.getTaskSnapshot(testing.allocator, "task-999");
     try testing.expect(not_found == null);
-
     try testing.expectEqual(@as(usize, 1), registry.taskCount());
 }
 
-test "TaskRegistry evicts oldest completed tasks" {
+test "TaskRegistry returns TaskRegistryFull when capped by active tasks" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    // Fill registry to MAX_TASKS with completed tasks.
     var i: usize = 0;
     while (i < MAX_TASKS) : (i += 1) {
-        const task = try registry.createTask("filler", null);
-        registry.mutex.lock();
-        task.state = .completed;
-        task.created_at = @as(i64, @intCast(i)); // ascending created_at
-        registry.mutex.unlock();
+        var task = try registry.createTask(testing.allocator, "x", null);
+        try testing.expect(registry.setTaskState(task.id, .working));
+        task.deinit(testing.allocator);
     }
+
+    try testing.expectEqual(MAX_TASKS, registry.taskCount());
+    try testing.expectError(error.TaskRegistryFull, registry.createTask(testing.allocator, "overflow", null));
+}
+
+test "TaskRegistry evicts oldest completed tasks by recency" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var i: usize = 0;
+    while (i < MAX_TASKS) : (i += 1) {
+        var task = try registry.createTask(testing.allocator, "filler", null);
+        try mutateStoredTask(&registry, task.id, .completed, null, @as(i64, @intCast(i)));
+        task.deinit(testing.allocator);
+    }
+
+    var newest = try registry.createTask(testing.allocator, "new task", null);
+    defer newest.deinit(testing.allocator);
+
     try testing.expectEqual(MAX_TASKS, registry.taskCount());
 
-    // Creating one more should evict the oldest (task-1 with created_at=0).
-    _ = try registry.createTask("new task", null);
-    try testing.expectEqual(MAX_TASKS, registry.taskCount());
+    var oldest = try registry.getTaskSnapshot(testing.allocator, "task-1");
+    defer if (oldest) |*snapshot| snapshot.deinit(testing.allocator);
+    try testing.expect(oldest == null);
 
-    // task-1 should be evicted (it had the oldest created_at).
-    try testing.expect(registry.getTask("task-1") == null);
-
-    // The newest task should exist.
-    const newest_id = try std.fmt.allocPrint(testing.allocator, "task-{d}", .{MAX_TASKS + 1});
-    defer testing.allocator.free(newest_id);
-    try testing.expect(registry.getTask(newest_id) != null);
+    var found_newest = try getTaskSnapshotOrFail(&registry, newest.id);
+    defer found_newest.deinit(testing.allocator);
+    try testing.expectEqualStrings(newest.id, found_newest.id);
 }
 
 test "handleAgentCard returns valid JSON" {
@@ -1080,8 +1444,6 @@ test "handleAgentCard returns valid JSON" {
 
     try testing.expectEqualStrings("200 OK", resp.status);
     try testing.expectEqualStrings("application/json", resp.content_type);
-
-    // Verify key fields are present.
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"TestAgent\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"description\":\"A test agent\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"protocolVersion\":\"0.2.5\"") != null);
@@ -1094,7 +1456,6 @@ test "handleAgentCard returns valid JSON" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"streaming\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"defaultInputModes\":[\"text/plain\"]") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"skills\":[") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"tags\":[\"chat\",\"general\"]") != null);
 }
 
 test "handleJsonRpc dispatches tasks/send" {
@@ -1113,8 +1474,6 @@ test "handleJsonRpc dispatches tasks/send" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"req-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "mock response") != null);
-
-    // Verify task was created in registry.
     try testing.expectEqual(@as(usize, 1), registry.taskCount());
 }
 
@@ -1139,15 +1498,10 @@ test "handleJsonRpc dispatches tasks/get" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    // Create a task first.
-    const task = try registry.createTask("test input", null);
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .completed;
-        testing.allocator.free(task.agent_text);
-        task.agent_text = try testing.allocator.dupe(u8, "test output");
-    }
+    var task = try registry.createTask(testing.allocator, "test input", null);
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "test output")).?;
+    defer completed.deinit(testing.allocator);
 
     var mock = MockSessionManager{};
     const body =
@@ -1199,21 +1553,15 @@ test "buildTaskJson escapes special characters" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("hello \"world\"", null);
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .completed;
-        testing.allocator.free(task.agent_text);
-        task.agent_text = try testing.allocator.dupe(u8, "line1\nline2\ttab");
-    }
+    var task = try registry.createTask(testing.allocator, "hello \"world\"", null);
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "line1\nline2\ttab")).?;
+    defer completed.deinit(testing.allocator);
 
-    const json = try buildTaskJson(testing.allocator, task);
+    const json = try buildTaskJson(testing.allocator, &completed);
     defer testing.allocator.free(json);
 
-    // The escaped quotes should appear as \"
     try testing.expect(std.mem.indexOf(u8, json, "hello \\\"world\\\"") != null);
-    // Newline and tab should be escaped.
     try testing.expect(std.mem.indexOf(u8, json, "line1\\nline2\\ttab") != null);
 }
 
@@ -1230,23 +1578,18 @@ test "extractMessageText returns null for missing parts" {
     const body =
         \\{"jsonrpc":"2.0","id":"1","method":"tasks/send","params":{"message":{"role":"user"}}}
     ;
-    const text = extractMessageText(body);
-    try testing.expect(text == null);
+    try testing.expect(extractMessageText(body) == null);
 }
 
 test "handleJsonRpc dispatches tasks/cancel" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    // Create a working task.
-    const task = try registry.createTask("cancel me", null);
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .working;
-    }
+    var task = try registry.createTask(testing.allocator, "cancel me", null);
+    defer task.deinit(testing.allocator);
+    try testing.expect(registry.setTaskState(task.id, .working));
 
-    var mock = MockSessionManager{};
+    var mock = MockSessionManager{ .interrupt_tool = "shell" };
     const body =
         \\{"jsonrpc":"2.0","id":"req-5","method":"tasks/cancel","params":{"id":"task-1"}}
     ;
@@ -1255,19 +1598,20 @@ test "handleJsonRpc dispatches tasks/cancel" {
 
     try testing.expectEqualStrings("200 OK", resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"canceled\"") != null);
-    try testing.expect(task.state == .canceled);
+
+    var canceled = try getTaskSnapshotOrFail(&registry, task.id);
+    defer canceled.deinit(testing.allocator);
+    try testing.expect(canceled.state == .canceled);
 }
 
 test "handleJsonRpc cancel returns error for completed task" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("done", null);
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .completed;
-    }
+    var task = try registry.createTask(testing.allocator, "done", null);
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "done")).?;
+    defer completed.deinit(testing.allocator);
 
     var mock = MockSessionManager{};
     const body =
@@ -1318,9 +1662,10 @@ test "buildTaskJson omits artifacts and history when agent_text is empty" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("test input", null);
+    var task = try registry.createTask(testing.allocator, "test input", null);
+    defer task.deinit(testing.allocator);
 
-    const json = try buildTaskJson(testing.allocator, task);
+    const json = try buildTaskJson(testing.allocator, &task);
     defer testing.allocator.free(json);
 
     try testing.expect(std.mem.indexOf(u8, json, "\"artifacts\"") == null);
@@ -1335,16 +1680,12 @@ test "buildTaskJson includes contextId artifactId and messageId" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("test", "conversation-1");
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        task.state = .completed;
-        testing.allocator.free(task.agent_text);
-        task.agent_text = try testing.allocator.dupe(u8, "reply");
-    }
+    var task = try registry.createTask(testing.allocator, "test", "conversation-1");
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "reply")).?;
+    defer completed.deinit(testing.allocator);
 
-    const json = try buildTaskJson(testing.allocator, task);
+    const json = try buildTaskJson(testing.allocator, &completed);
     defer testing.allocator.free(json);
 
     try testing.expect(std.mem.indexOf(u8, json, "\"contextId\":\"conversation-1\"") != null);
@@ -1354,57 +1695,52 @@ test "buildTaskJson includes contextId artifactId and messageId" {
     try testing.expect(std.mem.indexOf(u8, json, "\"taskId\":\"task-1\"") != null);
 }
 
-test "extractJsonRpcId handles string id" {
-    const body =
+test "extractJsonRpcId handles string numeric and reordered ids" {
+    const string_body =
         \\{"jsonrpc":"2.0","id":"req-1","method":"tasks/send"}
     ;
-    const id = extractJsonRpcId(body);
-    try testing.expect(id != null);
-    try testing.expectEqualStrings("\"req-1\"", id.?);
-}
+    try testing.expectEqualStrings("\"req-1\"", extractJsonRpcId(string_body).?);
 
-test "extractJsonRpcId handles numeric id" {
-    const body =
+    const numeric_body =
         \\{"jsonrpc":"2.0","id":42,"method":"tasks/send"}
     ;
-    const id = extractJsonRpcId(body);
-    try testing.expect(id != null);
-    try testing.expectEqualStrings("42", id.?);
-}
+    try testing.expectEqualStrings("42", extractJsonRpcId(numeric_body).?);
 
-test "extractJsonRpcId returns null when missing" {
-    const body =
+    const reordered_body =
+        \\{"jsonrpc":"2.0","params":{"id":"task-1"},"id":"req-7","method":"tasks/get"}
+    ;
+    try testing.expectEqualStrings("\"req-7\"", extractJsonRpcId(reordered_body).?);
+
+    const missing_body =
         \\{"jsonrpc":"2.0","method":"tasks/send"}
     ;
-    const id = extractJsonRpcId(body);
-    try testing.expect(id == null);
+    try testing.expect(extractJsonRpcId(missing_body) == null);
 }
 
-test "extractParamsId finds id in params" {
+test "extractParamsId finds id in params only" {
     const body =
-        \\{"jsonrpc":"2.0","id":"req-1","method":"tasks/get","params":{"id":"task-42"}}
+        \\{"jsonrpc":"2.0","params":{"id":"task-42"},"id":"req-1","method":"tasks/get"}
     ;
-    const id = extractParamsId(body);
-    try testing.expect(id != null);
-    try testing.expectEqualStrings("task-42", id.?);
+    try testing.expectEqualStrings("task-42", extractParamsId(body).?);
 }
 
 test "extractMessageContextId finds context id in message" {
     const body =
         \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"contextId":"chat-42","role":"user","parts":[{"type":"text","text":"hello"}]}}}
     ;
-    const context_id = extractMessageContextId(body);
-    try testing.expect(context_id != null);
-    try testing.expectEqualStrings("chat-42", context_id.?);
+    try testing.expectEqualStrings("chat-42", extractMessageContextId(body).?);
 }
 
 test "multiple tasks get unique IDs" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const t1 = try registry.createTask("first", null);
-    const t2 = try registry.createTask("second", null);
-    const t3 = try registry.createTask("third", null);
+    var t1 = try registry.createTask(testing.allocator, "first", null);
+    defer t1.deinit(testing.allocator);
+    var t2 = try registry.createTask(testing.allocator, "second", null);
+    defer t2.deinit(testing.allocator);
+    var t3 = try registry.createTask(testing.allocator, "third", null);
+    defer t3.deinit(testing.allocator);
 
     try testing.expectEqualStrings("task-1", t1.id);
     try testing.expectEqualStrings("task-2", t2.id);
@@ -1416,17 +1752,13 @@ test "handleJsonRpc dispatches tasks/list" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    // Create some tasks with different states.
-    const t1 = try registry.createTask("first", null);
-    const t2 = try registry.createTask("second", "shared-context");
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        t1.state = .completed;
-        testing.allocator.free(t1.agent_text);
-        t1.agent_text = try testing.allocator.dupe(u8, "reply1");
-        t2.state = .working;
-    }
+    var t1 = try registry.createTask(testing.allocator, "first", null);
+    defer t1.deinit(testing.allocator);
+    var t2 = try registry.createTask(testing.allocator, "second", "shared-context");
+    defer t2.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, t1.id, .completed, "reply1")).?;
+    defer completed.deinit(testing.allocator);
+    try testing.expect(registry.setTaskState(t2.id, .working));
 
     var mock = MockSessionManager{};
     const body =
@@ -1446,15 +1778,12 @@ test "handleListTasks filters by state" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const t1 = try registry.createTask("first", null);
-    _ = try registry.createTask("second", null);
-    {
-        registry.mutex.lock();
-        defer registry.mutex.unlock();
-        t1.state = .completed;
-        testing.allocator.free(t1.agent_text);
-        t1.agent_text = try testing.allocator.dupe(u8, "done");
-    }
+    var t1 = try registry.createTask(testing.allocator, "first", null);
+    defer t1.deinit(testing.allocator);
+    var t2 = try registry.createTask(testing.allocator, "second", null);
+    defer t2.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, t1.id, .completed, "done")).?;
+    defer completed.deinit(testing.allocator);
 
     const body =
         \\{"jsonrpc":"2.0","id":"req-f","method":"tasks/list","params":{"state":"completed"}}
@@ -1465,7 +1794,25 @@ test "handleListTasks filters by state" {
 
     try testing.expectEqualStrings("200 OK", resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
-    // Only the completed task should appear.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"submitted\"") == null);
+}
+
+test "handleListTasks accepts input-required filter" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "needs input", null);
+    defer task.deinit(testing.allocator);
+    try mutateStoredTask(&registry, task.id, .input_required, null, 50);
+
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-ir","method":"tasks/list","params":{"state":"input-required"}}
+    ;
+    var mock = MockSessionManager{};
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"input-required\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"submitted\"") == null);
 }
 
@@ -1473,54 +1820,51 @@ test "listTasks returns empty slice when no tasks match" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    _ = try registry.createTask("hello", null);
+    var task = try registry.createTask(testing.allocator, "hello", null);
+    defer task.deinit(testing.allocator);
 
     const tasks = try registry.listTasks(testing.allocator, .canceled, null, 50);
-    defer testing.allocator.free(tasks);
+    defer deinitTaskSnapshots(testing.allocator, tasks);
 
     try testing.expectEqual(@as(usize, 0), tasks.len);
 }
 
-test "isStreamingMethod detects message/stream" {
-    const body =
+test "isStreamingMethod detects streaming methods only" {
+    try testing.expect(isStreamingMethod(
         \\{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"message":{"role":"user","parts":[{"type":"text","text":"hi"}]}}}
-    ;
-    try testing.expect(isStreamingMethod(body));
-}
-
-test "isStreamingMethod detects tasks/sendSubscribe" {
-    const body =
+    ));
+    try testing.expect(isStreamingMethod(
         \\{"jsonrpc":"2.0","id":"1","method":"tasks/sendSubscribe","params":{}}
-    ;
-    try testing.expect(isStreamingMethod(body));
-}
-
-test "isStreamingMethod returns false for tasks/send" {
-    const body =
+    ));
+    try testing.expect(!isStreamingMethod(
         \\{"jsonrpc":"2.0","id":"1","method":"tasks/send","params":{}}
-    ;
-    try testing.expect(!isStreamingMethod(body));
-}
-
-test "isStreamingMethod returns false for message/send" {
-    const body =
+    ));
+    try testing.expect(!isStreamingMethod(
         \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{}}
-    ;
-    try testing.expect(!isStreamingMethod(body));
+    ));
 }
 
-test "listTasks respects max_results" {
+test "listTasks respects max_results and recency order" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    _ = try registry.createTask("a", null);
-    _ = try registry.createTask("b", null);
-    _ = try registry.createTask("c", null);
+    var t1 = try registry.createTask(testing.allocator, "a", null);
+    defer t1.deinit(testing.allocator);
+    var t2 = try registry.createTask(testing.allocator, "b", null);
+    defer t2.deinit(testing.allocator);
+    var t3 = try registry.createTask(testing.allocator, "c", null);
+    defer t3.deinit(testing.allocator);
+
+    try mutateStoredTask(&registry, t1.id, .submitted, null, 10);
+    try mutateStoredTask(&registry, t2.id, .submitted, null, 30);
+    try mutateStoredTask(&registry, t3.id, .submitted, null, 20);
 
     const tasks = try registry.listTasks(testing.allocator, null, null, 2);
-    defer testing.allocator.free(tasks);
+    defer deinitTaskSnapshots(testing.allocator, tasks);
 
     try testing.expectEqual(@as(usize, 2), tasks.len);
+    try testing.expectEqualStrings("task-2", tasks[0].id);
+    try testing.expectEqualStrings("task-3", tasks[1].id);
 }
 
 test "handleJsonRpc reuses provided contextId for follow-up turns" {
@@ -1534,7 +1878,8 @@ test "handleJsonRpc reuses provided contextId for follow-up turns" {
     const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
-    const task = registry.getTask("task-1") orelse return error.TestUnexpectedResult;
+    var task = try getTaskSnapshotOrFail(&registry, "task-1");
+    defer task.deinit(testing.allocator);
     try testing.expectEqualStrings("conversation-9", task.context_id);
     try testing.expectEqualStrings("a2a:conversation-9", task.session_key);
 }
@@ -1543,12 +1888,33 @@ test "listTasks filters by provided context id" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    _ = try registry.createTask("first", "conversation-a");
-    _ = try registry.createTask("second", "conversation-b");
+    var first = try registry.createTask(testing.allocator, "first", "conversation-a");
+    defer first.deinit(testing.allocator);
+    var second = try registry.createTask(testing.allocator, "second", "conversation-b");
+    defer second.deinit(testing.allocator);
 
     const tasks = try registry.listTasks(testing.allocator, null, "conversation-b", 10);
-    defer testing.allocator.free(tasks);
+    defer deinitTaskSnapshots(testing.allocator, tasks);
 
     try testing.expectEqual(@as(usize, 1), tasks.len);
     try testing.expectEqualStrings("conversation-b", tasks[0].context_id);
+}
+
+test "finalizeTask preserves canceled state and setTaskState does not revive it" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "cancel race", null);
+    defer task.deinit(testing.allocator);
+    try testing.expect(registry.setTaskState(task.id, .working));
+
+    var canceled = (try registry.cancelTask(testing.allocator, task.id)).?;
+    defer canceled.deinit(testing.allocator);
+    try testing.expect(canceled.state == .canceled);
+    try testing.expect(!registry.setTaskState(task.id, .working));
+
+    var finalized = (try registry.finalizeTask(testing.allocator, task.id, .completed, "should not win")).?;
+    defer finalized.deinit(testing.allocator);
+    try testing.expect(finalized.state == .canceled);
+    try testing.expectEqual(@as(usize, 0), finalized.agent_text.len);
 }

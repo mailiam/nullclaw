@@ -1718,6 +1718,7 @@ pub const Agent = struct {
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
+            providers.clearLastApiErrorDetail();
             if (is_streaming) {
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -1889,6 +1890,12 @@ pub const Agent = struct {
                             self.emitUsageFailure(turn_model_name);
                             return retry_after_compact_err;
                         };
+                    }
+
+                    if (self.routeShouldBeDegraded(err)) {
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
+                        self.emitUsageFailure(turn_model_name);
+                        return err;
                     }
 
                     // Retry once
@@ -4316,6 +4323,147 @@ test "turn retains user message on provider error" {
     // Should not double-free when clearing history after a failed turn.
     agent.clearHistory();
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
+}
+
+test "turn does not retry immediately on rate limit" {
+    const RateLimitedProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            return error.RateLimited;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "rate-limited-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RateLimitedProvider.chatWithSystem,
+        .chat = RateLimitedProvider.chat,
+        .supportsNativeTools = RateLimitedProvider.supportsNativeTools,
+        .getName = RateLimitedProvider.getName,
+        .deinit = RateLimitedProvider.deinitFn,
+    };
+    var state = RateLimitedProvider.State{};
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+
+    try std.testing.expectError(error.RateLimited, agent.turn("hello"));
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+}
+
+test "turn still retries non-rate-limited provider failures once" {
+    const RetryProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "retry-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RetryProvider.chatWithSystem,
+        .chat = RetryProvider.chat,
+        .supportsNativeTools = RetryProvider.supportsNativeTools,
+        .getName = RetryProvider.getName,
+        .deinit = RetryProvider.deinitFn,
+    };
+    var state = RetryProvider.State{};
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    providers.clearLastApiErrorDetail();
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    defer providers.clearLastApiErrorDetail();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+
+    try std.testing.expectError(error.ProviderFailed, agent.turn("hello"));
+    try std.testing.expectEqual(@as(u32, 2), state.calls);
 }
 
 test "slash /help returns help text" {

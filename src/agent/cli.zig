@@ -75,6 +75,36 @@ fn maybePrintAllProvidersFailedHint(
     );
 }
 
+fn providerFailureLooksRateLimited(detail: []const u8) bool {
+    return providers.reliable.isRateLimited(detail);
+}
+
+fn writeRateLimitHint(w: *std.Io.Writer, default_provider: []const u8) !void {
+    try w.print(
+        "Hint: {s} appears rate-limited. Low-quota coding plans often reject tool-heavy agent loops even when plain chat still works.\n",
+        .{default_provider},
+    );
+    try w.writeAll(
+        "Hint: keep \"reliability.provider_retries\" low, raise \"reliability.provider_backoff_ms\", and add \"reliability.fallback_providers\" or \"reliability.api_keys\" if you have alternatives.\n",
+    );
+    try w.writeAll(
+        "Hint: use `nullclaw agent --verbose` for foreground runs. In service mode, inspect `~/.nullclaw/logs/daemon.stdout.log` and `~/.nullclaw/logs/daemon.stderr.log`.\n",
+    );
+}
+
+fn maybePrintRateLimitHint(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    default_provider: []const u8,
+) !void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |msg| {
+        defer allocator.free(msg);
+        if (!providerFailureLooksRateLimited(msg)) return;
+        try writeRateLimitHint(w, default_provider);
+    }
+}
+
 fn maybePrintLastProviderApiError(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -332,8 +362,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 try w.flush();
                 return;
             }
+            if (err == error.RateLimited) {
+                try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
+                try writeRateLimitHint(w, cfg.default_provider);
+                try w.flush();
+            }
             if (err == error.AllProvidersFailed) {
                 try maybePrintLastProviderApiError(allocator, w);
+                try maybePrintRateLimitHint(allocator, w, cfg.default_provider);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
                 try w.flush();
             }
@@ -451,9 +488,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
+            } else if (err == error.RateLimited) {
+                try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
+                try writeRateLimitHint(w, cfg.default_provider);
             } else if (err == error.AllProvidersFailed) {
                 try w.print("Error: {}\n", .{err});
                 try maybePrintLastProviderApiError(allocator, w);
+                try maybePrintRateLimitHint(allocator, w, cfg.default_provider);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
             } else {
                 try w.print("Error: {}\n", .{err});
@@ -590,4 +632,19 @@ test "shouldPrintOpenAiCodexHint false when provider is openai-codex" {
 
 test "shouldPrintOpenAiCodexHint false when codex auth is missing" {
     try std.testing.expect(!shouldPrintOpenAiCodexHint("openai", false));
+}
+
+test "providerFailureLooksRateLimited detects rate limit detail" {
+    try std.testing.expect(providerFailureLooksRateLimited("compatible: status=429 message=Rate limit exceeded"));
+    try std.testing.expect(!providerFailureLooksRateLimited("compatible: status=401 message=Unauthorized"));
+}
+
+test "writeRateLimitHint mentions reliability knobs and logs" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeRateLimitHint(&aw.writer, "kimi");
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "reliability.provider_backoff_ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "~/.nullclaw/logs/daemon.stdout.log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "kimi appears rate-limited") != null);
 }

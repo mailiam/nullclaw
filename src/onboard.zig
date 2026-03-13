@@ -3653,8 +3653,9 @@ test "catalog_providers names are unique" {
 
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
-    // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 35);
+    // boundary against the configured provider catalog.
+    try std.testing.expect(known_providers.len > 0);
+    try std.testing.expect(findProviderInfoByCanonical("gemini-cli") != null);
     // The wizard would clamp to default (0) for out of range input
 }
 

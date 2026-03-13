@@ -23,6 +23,7 @@ const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
 const util = @import("util.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
+const gemini_cli_mod = @import("providers/gemini_cli.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -135,6 +136,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+    .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -331,6 +333,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
     if (std.mem.eql(u8, canonical, "openai-codex")) return &codex_support.codex_model_fallbacks;
+    if (std.mem.eql(u8, canonical, "gemini-cli")) return &gemini_cli_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -414,6 +417,11 @@ const claude_cli_fallback = [_][]const u8{
     "claude-opus-4-6",
 };
 
+const gemini_cli_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
 const MAX_MODELS = 20;
 
 /// Return a heap-allocated copy of the static fallback list for a provider.
@@ -486,6 +494,18 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
             try result.append(allocator, try allocator.dupe(u8, m));
         }
         return result.toOwnedSlice(allocator);
+    }
+
+    // For the gemini CLI, try to fetch models dynamically via `gemini -p "/model"`;
+    // fall back to the static list when the CLI is unavailable or returns nothing.
+    // Contract: `fetchModels` always returns either the compile-time `&.{}` literal
+    // (when empty/failed — not heap-allocated, must not be freed) or a fully
+    // heap-allocated slice (when len > 0 — returned directly to our caller who
+    // owns it).  We therefore free nothing when len == 0.
+    if (std.mem.eql(u8, canonical, "gemini-cli")) {
+        const dynamic = gemini_cli_mod.GeminiCliProvider.fetchModels(allocator);
+        if (dynamic.len > 0) return dynamic;
+        return dupeFallbackModels(allocator, canonical);
     }
 
     // Determine URL, auth, and optional prefix filter
@@ -3766,6 +3786,9 @@ test "fallbackModelsForProvider returns models for known providers" {
     const openai_codex_models = fallbackModelsForProvider("openai-codex");
     try std.testing.expect(openai_codex_models.len >= 1);
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, openai_codex_models[0]);
+    const gemini_cli_models = fallbackModelsForProvider("gemini-cli");
+    try std.testing.expect(gemini_cli_models.len >= 1);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", gemini_cli_models[0]);
 }
 
 test "fallbackModelsForProvider handles aliases" {

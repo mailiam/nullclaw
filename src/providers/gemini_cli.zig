@@ -29,6 +29,7 @@ pub const GeminiCliProvider = struct {
     session_id: ?[]const u8 = null,
     next_id: u32 = 1,
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    read_offset: usize = 0,
 
     const DEFAULT_MODEL = "gemini-2.0-flash";
     const CLI_NAME = "gemini";
@@ -133,6 +134,7 @@ pub const GeminiCliProvider = struct {
             self.session_id = null;
         }
         self.read_buffer.clearRetainingCapacity();
+        self.read_offset = 0;
     }
 
     /// Ensure the gemini agent process is running and a session is created.
@@ -143,17 +145,24 @@ pub const GeminiCliProvider = struct {
         // Clean up any stale state
         self.stopInternal();
 
-        const argv = try self.allocator.alloc([]const u8, 4);
-        errdefer self.allocator.free(argv);
-        argv[0] = try self.allocator.dupe(u8, CLI_NAME);
-        argv[1] = try self.allocator.dupe(u8, "--experimental-acp");
-        argv[2] = try self.allocator.dupe(u8, "--approval-mode");
-        argv[3] = try self.allocator.dupe(u8, "yolo");
-        self.child_argv = argv;
+        var argv_list = std.ArrayList([]const u8).init(self.allocator);
+        errdefer {
+            for (argv_list.items) |arg| self.allocator.free(arg);
+            argv_list.deinit();
+        }
+        try argv_list.append(try self.allocator.dupe(u8, CLI_NAME));
+        try argv_list.append(try self.allocator.dupe(u8, "--experimental-acp"));
+        try argv_list.append(try self.allocator.dupe(u8, "--approval-mode"));
+        // NOTE: "yolo" mode is used here to allow the gemini-cli agent to perform
+        // its internal tool calls (like reading workspace context) without
+        // interactive approval, which is required for non-interactive ACP sessions.
+        // Higher-level security is enforced by nullclaw's own tool approval logic.
+        try argv_list.append(try self.allocator.dupe(u8, "yolo"));
+        self.child_argv = try argv_list.toOwnedSlice();
         
         const child = try self.allocator.create(std.process.Child);
         errdefer self.allocator.destroy(child);
-        child.* = std.process.Child.init(argv, self.allocator);
+        child.* = std.process.Child.init(self.child_argv.?, self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
@@ -168,8 +177,17 @@ pub const GeminiCliProvider = struct {
 
         var req_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer req_buf.deinit(self.allocator);
-        var writer = req_buf.writer(self.allocator);
-        try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"session/new\",\"params\":{{\"cwd\":\".\",\"mcpServers\":[]}}}}\n", .{id});
+        
+        try std.json.stringify(.{
+            .jsonrpc = "2.0",
+            .id = id,
+            .method = "session/new",
+            .params = .{
+                .cwd = ".",
+                .mcpServers = &[_]u8{},
+            },
+        }, .{}, req_buf.writer(self.allocator));
+        try req_buf.append(self.allocator, '\n');
 
         std.debug.print("[GeminiCLI] sending session/new handshake...\n", .{});
         try self.child.?.stdin.?.writeAll(req_buf.items);
@@ -232,21 +250,22 @@ pub const GeminiCliProvider = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        // session/prompt: {"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"...","prompt":[{"type":"text","text":"..."}]}}
         var msg_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer msg_buf.deinit(allocator);
-        try msg_buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try std.fmt.format(msg_buf.writer(allocator), "{d}", .{id});
-        try msg_buf.appendSlice(allocator, ",\"method\":\"session/prompt\",\"params\":{\"sessionId\":");
-        try json_util.appendJsonString(&msg_buf, allocator, self.session_id.?);
-        try msg_buf.appendSlice(allocator, ",\"model\":");
-        try json_util.appendJsonString(&msg_buf, allocator, model);
-        try msg_buf.appendSlice(allocator, ",\"prompt\":[{\"type\":\"text\",\"text\":");
         
-        // Escape prompt using our local json_util
-        try json_util.appendJsonString(&msg_buf, allocator, prompt);
-        
-        try msg_buf.appendSlice(allocator, "}]}}\n");
+        try std.json.stringify(.{
+            .jsonrpc = "2.0",
+            .id = id,
+            .method = "session/prompt",
+            .params = .{
+                .sessionId = self.session_id.?,
+                .model = model,
+                .prompt = &[_]struct { type: []const u8, text: []const u8 }{
+                    .{ .type = "text", .text = prompt },
+                },
+            },
+        }, .{}, msg_buf.writer(allocator));
+        try msg_buf.append(allocator, '\n');
 
         try self.child.?.stdin.?.writeAll(msg_buf.items);
 
@@ -276,22 +295,14 @@ pub const GeminiCliProvider = struct {
             if (obj.get("method")) |method| {
                 if (method == .string and std.mem.eql(u8, method.string, "session/update")) {
                     std.debug.print("[GeminiCLI] session/update received\n", .{});
-                    if (obj.get("params")) |params_val| {
-                        if (params_val == .object) {
-                            if (params_val.object.get("update")) |update_val| {
-                                if (update_val == .object) {
-                                    if (update_val.object.get("content")) |content_val| {
-                                        if (content_val == .object) {
-                                            if (content_val.object.get("text")) |text_val| {
-                                                if (text_val == .string) {
-                                                    std.debug.print("[GeminiCLI] appending update text (len={d})\n", .{text_val.string.len});
-                                                    try result_buf.appendSlice(allocator, text_val.string);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                    
+                    const params = if (obj.get("params")) |p| if (p == .object) p.object else continue else continue;
+                    const update = if (params.get("update")) |u| if (u == .object) u.object else continue else continue;
+                    const content = if (update.get("content")) |c| if (c == .object) c.object else continue else continue;
+                    if (content.get("text")) |text_val| {
+                        if (text_val == .string) {
+                            std.debug.print("[GeminiCLI] appending update text (len={d})\n", .{text_val.string.len});
+                            try result_buf.appendSlice(allocator, text_val.string);
                         }
                     }
                     continue;
@@ -350,14 +361,13 @@ pub const GeminiCliProvider = struct {
 
         while (true) {
             // Check if we already have a full line in the buffer
-            if (std.mem.indexOfScalar(u8, self.read_buffer.items, '\n')) |pos| {
-                const line = try allocator.dupe(u8, self.read_buffer.items[0..pos]);
+            const search_slice = self.read_buffer.items[self.read_offset..];
+            if (std.mem.indexOfScalar(u8, search_slice, '\n')) |pos| {
+                const line_end = self.read_offset + pos;
+                const line = try allocator.dupe(u8, self.read_buffer.items[self.read_offset..line_end]);
                 errdefer allocator.free(line);
                 
-                // Remove the line (including \n) from the persistent buffer
-                const total_len = pos + 1;
-                std.mem.copyForwards(u8, self.read_buffer.items[0 .. self.read_buffer.items.len - total_len], self.read_buffer.items[total_len..]);
-                self.read_buffer.items.len -= total_len;
+                self.read_offset = line_end + 1;
 
                 // Strip non-JSON prefixes
                 const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -368,6 +378,14 @@ pub const GeminiCliProvider = struct {
                 std.debug.print("[GeminiCLI] noise: {s}\n", .{line});
                 allocator.free(line);
                 continue;
+            }
+
+            // No newline found, compact and read more data
+            if (self.read_offset > 0) {
+                const remaining = self.read_buffer.items.len - self.read_offset;
+                std.mem.copyForwards(u8, self.read_buffer.items[0..remaining], self.read_buffer.items[self.read_offset..]);
+                self.read_buffer.items.len = remaining;
+                self.read_offset = 0;
             }
 
             // Read more data from stdout
@@ -410,11 +428,18 @@ pub const GeminiCliProvider = struct {
         const term = try child.wait();
         switch (term) {
             .Exited => |code| {
-                if (code != 0) return error.CliProcessFailed;
+                if (code == 0) {
+                    return try self.parseModelsJson(allocator, out);
+                }
             },
-            else => return error.CliProcessFailed,
+            else => {},
         }
 
+        return error.CliProcessFailed;
+    }
+
+    fn parseModelsJson(self: *GeminiCliProvider, allocator: std.mem.Allocator, out: []const u8) ![][]const u8 {
+        _ = self;
         // Extract tokens that look like Gemini model IDs ("gemini-*").
         var models: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {

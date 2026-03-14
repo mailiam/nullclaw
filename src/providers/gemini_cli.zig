@@ -334,9 +334,9 @@ pub const GeminiCliProvider = struct {
                         
                         // Record detailed error message if available
                         if (err_val == .object) {
-                            if (err_val.object.get("message")) |msg| {
-                                if (msg == .string) {
-                                    root.setLastApiErrorDetail("gemini-cli", msg.string);
+                            if (err_val.object.get("message")) |err_msg_val| {
+                                if (err_msg_val == .string) {
+                                    root.setLastApiErrorDetail("gemini-cli", err_msg_val.string);
                                 }
                             }
                         }

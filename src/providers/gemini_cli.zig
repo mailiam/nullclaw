@@ -317,14 +317,13 @@ pub const GeminiCliProvider = struct {
     }
 
     fn fetchModelsInternal(allocator: std.mem.Allocator) ![][]const u8 {
-        var argv_storage: [10][]const u8 = undefined;
-        var argv_list = std.ArrayList([]const u8).fromFixedBuffer(&argv_storage);
-        try argv_list.append(CLI_NAME);
-        try argv_list.append("-p");
-        try argv_list.append("/model");
-        try argv_list.append("-o");
-        try argv_list.append("stream-json");
-        const argv = argv_list.items;
+        const argv = &[_][]const u8{
+            CLI_NAME,
+            "-p",
+            "/model",
+            "-o",
+            "stream-json",
+        };
 
         var child = std.process.Child.init(argv, allocator);
         child.stdin_behavior = .Close;

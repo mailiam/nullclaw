@@ -145,20 +145,20 @@ pub const GeminiCliProvider = struct {
         // Clean up any stale state
         self.stopInternal();
 
-        var argv_list = std.ArrayList([]const u8).init(self.allocator);
+        var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (argv_list.items) |arg| self.allocator.free(arg);
-            argv_list.deinit();
+            argv_list.deinit(self.allocator);
         }
-        try argv_list.append(try self.allocator.dupe(u8, CLI_NAME));
-        try argv_list.append(try self.allocator.dupe(u8, "--experimental-acp"));
-        try argv_list.append(try self.allocator.dupe(u8, "--approval-mode"));
+        try argv_list.append(self.allocator, try self.allocator.dupe(u8, CLI_NAME));
+        try argv_list.append(self.allocator, try self.allocator.dupe(u8, "--experimental-acp"));
+        try argv_list.append(self.allocator, try self.allocator.dupe(u8, "--approval-mode"));
         // NOTE: "yolo" mode is used here to allow the gemini-cli agent to perform
         // its internal tool calls (like reading workspace context) without
         // interactive approval, which is required for non-interactive ACP sessions.
         // Higher-level security is enforced by nullclaw's own tool approval logic.
-        try argv_list.append(try self.allocator.dupe(u8, "yolo"));
-        self.child_argv = try argv_list.toOwnedSlice();
+        try argv_list.append(self.allocator, try self.allocator.dupe(u8, "yolo"));
+        self.child_argv = try argv_list.toOwnedSlice(self.allocator);
         
         const child = try self.allocator.create(std.process.Child);
         errdefer self.allocator.destroy(child);
@@ -429,7 +429,7 @@ pub const GeminiCliProvider = struct {
         switch (term) {
             .Exited => |code| {
                 if (code == 0) {
-                    return try self.parseModelsJson(allocator, out);
+                    return try parseModelsJson(allocator, out);
                 }
             },
             else => {},
@@ -437,45 +437,44 @@ pub const GeminiCliProvider = struct {
 
         return error.CliProcessFailed;
     }
+};
 
-    fn parseModelsJson(self: *GeminiCliProvider, allocator: std.mem.Allocator, out: []const u8) ![][]const u8 {
-        _ = self;
-        // Extract tokens that look like Gemini model IDs ("gemini-*").
-        var models: std.ArrayListUnmanaged([]const u8) = .empty;
-        errdefer {
-            for (models.items) |m| allocator.free(m);
-            models.deinit(allocator);
+fn parseModelsJson(allocator: std.mem.Allocator, out: []const u8) ![][]const u8 {
+    // Extract tokens that look like Gemini model IDs ("gemini-*").
+    var models: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (models.items) |m| allocator.free(m);
+        models.deinit(allocator);
+    }
+
+    var line_iter = std.mem.splitScalar(u8, out, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const obj = parsed.value.object;
+        const type_val = obj.get("type") orelse continue;
+        if (type_val != .string) continue;
+        
+        var text: ?[]const u8 = null;
+        if (std.mem.eql(u8, type_val.string, "message") or std.mem.eql(u8, type_val.string, "output")) {
+             if (obj.get("content")) |c| if (c == .string) { text = c.string; };
         }
 
-        var line_iter = std.mem.splitScalar(u8, out, '\n');
-        while (line_iter.next()) |line| {
-            if (line.len == 0) continue;
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value != .object) continue;
-            const obj = parsed.value.object;
-            const type_val = obj.get("type") orelse continue;
-            if (type_val != .string) continue;
-            
-            var text: ?[]const u8 = null;
-            if (std.mem.eql(u8, type_val.string, "message") or std.mem.eql(u8, type_val.string, "output")) {
-                 if (obj.get("content")) |c| if (c == .string) { text = c.string; };
-            }
-
-            if (text) |t| {
-                var token_iter = std.mem.tokenizeScalar(u8, t, ' ');
-                while (token_iter.next()) |tok| {
-                    const clean = std.mem.trim(u8, tok, " \t\r,;:");
-                    if (clean.len > "gemini-".len and std.mem.startsWith(u8, clean, "gemini-")) {
-                        try models.append(allocator, try allocator.dupe(u8, clean));
-                    }
+        if (text) |t| {
+            var token_iter = std.mem.tokenizeScalar(u8, t, ' ');
+            while (token_iter.next()) |tok| {
+                const clean = std.mem.trim(u8, tok, " \t\r,;:");
+                if (clean.len > "gemini-".len and std.mem.startsWith(u8, clean, "gemini-")) {
+                    try models.append(allocator, try allocator.dupe(u8, clean));
                 }
             }
         }
-
-        return models.toOwnedSlice(allocator);
     }
-};
+
+    return models.toOwnedSlice(allocator);
+}
 
 /// Run `<cli> --version` and verify exit code 0.
 fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {

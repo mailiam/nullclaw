@@ -66,6 +66,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "openrouter", .{ "OPENROUTER_API_KEY", "", "" } },
         .{ "openai", .{ "OPENAI_API_KEY", "", "" } },
         .{ "azure", .{ "AZURE_OPENAI_API_KEY", "", "" } },
+        .{ "azure-openai", .{ "AZURE_OPENAI_API_KEY", "", "" } },
         .{ "gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "vertex", .{ "VERTEX_API_KEY", "VERTEX_OAUTH_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN" } },
         .{ "groq", .{ "GROQ_API_KEY", "", "" } },
@@ -112,6 +113,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "lm-studio", .{ "API_KEY", "", "" } },
         .{ "claude-cli", .{ "ANTHROPIC_API_KEY", "", "" } },
         .{ "codex-cli", .{ "OPENAI_API_KEY", "", "" } },
+        .{ "gemini-cli", .{ "GEMINI_API_KEY", "", "" } },
     });
     return map.get(canonical) orelse .{ "", "", "" };
 }

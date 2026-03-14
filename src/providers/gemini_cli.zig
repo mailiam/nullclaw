@@ -23,13 +23,14 @@ pub const GeminiCliProvider = struct {
     model: []const u8,
     
     /// Persistent state
-    child: ?std.process.Child = null,
+    child: ?*std.process.Child = null,
+    child_argv: ?[][]const u8 = null,
     mutex: std.Thread.Mutex = .{},
     session_id: ?[]const u8 = null,
     next_id: u32 = 1,
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
 
-    const DEFAULT_MODEL = "gemini-2.5-pro";
+    const DEFAULT_MODEL = "gemini-2.0-flash";
     const CLI_NAME = "gemini";
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !GeminiCliProvider {
@@ -115,11 +116,17 @@ pub const GeminiCliProvider = struct {
     }
 
     fn stopInternal(self: *GeminiCliProvider) void {
-        if (self.child) |*child| {
+        if (self.child) |child| {
             if (child.stdin) |stdin| stdin.close();
             _ = child.kill() catch {};
             _ = child.wait() catch {};
+            self.allocator.destroy(child);
             self.child = null;
+        }
+        if (self.child_argv) |argv| {
+            for (argv) |arg| self.allocator.free(arg);
+            self.allocator.free(argv);
+            self.child_argv = null;
         }
         if (self.session_id) |sid| {
             self.allocator.free(sid);
@@ -131,33 +138,40 @@ pub const GeminiCliProvider = struct {
     /// Ensure the gemini agent process is running and a session is created.
     fn ensureStarted(self: *GeminiCliProvider) !void {
         if (self.child != null and self.session_id != null) return;
+        std.debug.print("[GeminiCLI] starting process...\n", .{});
 
         // Clean up any stale state
         self.stopInternal();
 
-        const argv = [_][]const u8{ CLI_NAME, "--experimental-acp", "--approval-mode", "yolo" };
-        var child = std.process.Child.init(&argv, self.allocator);
+        const argv = try self.allocator.alloc([]const u8, 4);
+        errdefer self.allocator.free(argv);
+        argv[0] = try self.allocator.dupe(u8, CLI_NAME);
+        argv[1] = try self.allocator.dupe(u8, "--experimental-acp");
+        argv[2] = try self.allocator.dupe(u8, "--approval-mode");
+        argv[3] = try self.allocator.dupe(u8, "yolo");
+        self.child_argv = argv;
+        
+        const child = try self.allocator.create(std.process.Child);
+        errdefer self.allocator.destroy(child);
+        child.* = std.process.Child.init(argv, self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore; // Ignore stderr to avoid blocking
+        child.stderr_behavior = .Inherit;
 
         try child.spawn();
         self.child = child;
+        std.debug.print("[GeminiCLI] process spawned (pid={d})\n", .{self.child.?.id});
 
         // Step 2: session/new
-        const cwd = try std.process.getCwdAlloc(self.allocator);
-        defer self.allocator.free(cwd);
-
         const id = self.next_id;
         self.next_id += 1;
 
         var req_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer req_buf.deinit(self.allocator);
         var writer = req_buf.writer(self.allocator);
-        try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"session/new\",\"params\":{{\"cwd\":", .{id});
-        try json_util.appendJsonString(&req_buf, self.allocator, cwd);
-        try writer.writeAll(",\"mcpServers\":[]}}}}\n");
+        try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"session/new\",\"params\":{{\"cwd\":\".\",\"mcpServers\":[]}}}}\n", .{id});
 
+        std.debug.print("[GeminiCLI] sending session/new handshake...\n", .{});
         try self.child.?.stdin.?.writeAll(req_buf.items);
 
         // Read responses until we get the result for our ID
@@ -165,28 +179,47 @@ pub const GeminiCliProvider = struct {
             const line = try self.readLine(self.allocator);
             defer self.allocator.free(line);
 
-            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch {
+                std.debug.print("[GeminiCLI] noise line: {s}\n", .{line});
+                continue;
+            };
             defer parsed.deinit();
 
-            if (parsed.value != .object) continue;
+            if (parsed.value != .object) {
+                std.debug.print("[GeminiCLI] noise line (non-object): {s}\n", .{line});
+                continue;
+            }
             const obj = parsed.value.object;
 
             if (obj.get("id")) |resp_id| {
                 if (resp_id == .integer and resp_id.integer == id) {
                     const result = obj.get("result") orelse {
-                        if (obj.get("error")) |err| {
-                            log.err("Gemini ACP session/new failed: {any}", .{err});
+                        if (obj.get("error")) |err_val| {
+                            log.err("Gemini ACP session/new failed with error: {any}", .{err_val});
+                        } else {
+                            log.err("Gemini ACP session/new failed: no result or error field. Response: {s}", .{line});
                         }
                         return error.InvalidHandshake;
                     };
-                    if (result != .object) return error.InvalidHandshake;
-                    const sid = result.object.get("sessionId") orelse return error.InvalidHandshake;
-                    if (sid != .string) return error.InvalidHandshake;
+                    if (result != .object) {
+                        log.err("Gemini ACP session/new failed: result is not an object. Response: {s}", .{line});
+                        return error.InvalidHandshake;
+                    }
+                    const sid = result.object.get("sessionId") orelse {
+                        log.err("Gemini ACP session/new failed: result object missing sessionId. Response: {s}", .{line});
+                        return error.InvalidHandshake;
+                    };
+                    if (sid != .string) {
+                        log.err("Gemini ACP session/new failed: sessionId is not a string. Response: {s}", .{line});
+                        return error.InvalidHandshake;
+                    }
 
                     self.session_id = try self.allocator.dupe(u8, sid.string);
+                    std.debug.print("[GeminiCLI] handshake complete, sessionId={s}\n", .{self.session_id.?});
                     break;
                 }
             }
+            std.debug.print("[GeminiCLI] non-target line: {s}\n", .{line});
         }
     }
 
@@ -222,27 +255,43 @@ pub const GeminiCliProvider = struct {
         defer result_buf.deinit(allocator);
 
         while (true) {
-            const line = self.readLine(allocator) catch |err| {
-                self.stopInternal(); // Restart on next call
-                return err;
-            };
-            defer allocator.free(line);
+            std.debug.print("[GeminiCLI] readLine attempt...\n", .{});
+            const line = try self.readLine(self.allocator);
+            defer self.allocator.free(line);
+            std.debug.print("[GeminiCLI] got line: {s}\n", .{line});
 
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+                std.debug.print("[GeminiCLI] json parse failed for line: {s}\n", .{line});
+                continue;
+            };
             defer parsed.deinit();
 
-            if (parsed.value != .object) continue;
+            if (parsed.value != .object) {
+                std.debug.print("[GeminiCLI] line not an object\n", .{});
+                continue;
+            }
             const obj = parsed.value.object;
 
             // session/update notifications
             if (obj.get("method")) |method| {
                 if (method == .string and std.mem.eql(u8, method.string, "session/update")) {
-                    const params = (obj.get("params") orelse continue).object;
-                    const update = (params.get("update") orelse continue).object;
-                    const content = (update.get("content") orelse continue).object;
-                    if (content.get("text")) |text_val| {
-                        if (text_val == .string) {
-                            try result_buf.appendSlice(allocator, text_val.string);
+                    std.debug.print("[GeminiCLI] session/update received\n", .{});
+                    if (obj.get("params")) |params_val| {
+                        if (params_val == .object) {
+                            if (params_val.object.get("update")) |update_val| {
+                                if (update_val == .object) {
+                                    if (update_val.object.get("content")) |content_val| {
+                                        if (content_val == .object) {
+                                            if (content_val.object.get("text")) |text_val| {
+                                                if (text_val == .string) {
+                                                    std.debug.print("[GeminiCLI] appending update text (len={d})\n", .{text_val.string.len});
+                                                    try result_buf.appendSlice(allocator, text_val.string);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     continue;
@@ -251,24 +300,41 @@ pub const GeminiCliProvider = struct {
 
             // Final result response
             if (obj.get("id")) |resp_id| {
+                std.debug.print("[GeminiCLI] response with id received\n", .{});
                 const id_match = switch (resp_id) {
                     .integer => |vid| vid == id,
                     .float => |vid| @as(u32, @intFromFloat(vid)) == id,
                     else => false,
                 };
                 if (id_match) {
+                    std.debug.print("[GeminiCLI] matched response id={d}\n", .{id});
                     // This is our response
                     if (obj.get("result")) |res| {
                         if (res == .object) {
                              if (res.object.get("content")) |c| {
                                  if (c == .string) {
                                      if (c.string.len > 0) {
+                                         std.debug.print("[GeminiCLI] final content received (len={d})\n", .{c.string.len});
                                          result_buf.clearRetainingCapacity();
                                          try result_buf.appendSlice(allocator, c.string);
                                      }
                                  }
                              }
                         }
+                    } else if (obj.get("error")) |err_val| {
+                        std.debug.print("[GeminiCLI] prompt failed with error: {any}\n", .{err_val});
+                        log.err("Gemini ACP prompt failed with error: {any}", .{err_val});
+                        
+                        // Record detailed error message if available
+                        if (err_val == .object) {
+                            if (err_val.object.get("message")) |msg| {
+                                if (msg == .string) {
+                                    root.setLastApiErrorDetail("gemini-cli", msg.string);
+                                }
+                            }
+                        }
+                        
+                        return error.ApiError;
                     }
                     break;
                 }
@@ -296,8 +362,10 @@ pub const GeminiCliProvider = struct {
                 // Strip non-JSON prefixes
                 const trimmed = std.mem.trim(u8, line, " \t\r");
                 if (trimmed.len > 0 and (trimmed[0] == '{' or trimmed[0] == '[')) {
+                    std.debug.print("[GeminiCLI] incoming: {s}\n", .{line});
                     return line;
                 }
+                std.debug.print("[GeminiCLI] noise: {s}\n", .{line});
                 allocator.free(line);
                 continue;
             }

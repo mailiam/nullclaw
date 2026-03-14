@@ -19,6 +19,7 @@ jobs:
       run:
         shell: bash
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -112,7 +113,7 @@ jobs:
 
       - name: Install Android NDK
         if: startsWith(matrix.target, 'android-')
-        run: sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+        run: yes | sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
 
       - name: Export Android NDK paths
         if: startsWith(matrix.target, 'android-')

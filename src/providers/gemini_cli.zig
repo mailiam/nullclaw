@@ -175,10 +175,7 @@ pub const GeminiCliProvider = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        var req_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer req_buf.deinit(self.allocator);
-        
-        try std.json.stringify(.{
+        const req = try std.json.Stringify.valueAlloc(self.allocator, .{
             .jsonrpc = "2.0",
             .id = id,
             .method = "session/new",
@@ -186,11 +183,12 @@ pub const GeminiCliProvider = struct {
                 .cwd = ".",
                 .mcpServers = &[_]u8{},
             },
-        }, .{}, req_buf.writer(self.allocator));
-        try req_buf.append(self.allocator, '\n');
+        }, .{});
+        defer self.allocator.free(req);
 
         std.debug.print("[GeminiCLI] sending session/new handshake...\n", .{});
-        try self.child.?.stdin.?.writeAll(req_buf.items);
+        try self.child.?.stdin.?.writeAll(req);
+        try self.child.?.stdin.?.writeAll("\n");
 
         // Read responses until we get the result for our ID
         while (true) {
@@ -250,10 +248,7 @@ pub const GeminiCliProvider = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        var msg_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer msg_buf.deinit(allocator);
-        
-        try std.json.stringify(.{
+        const msg = try std.json.Stringify.valueAlloc(allocator, .{
             .jsonrpc = "2.0",
             .id = id,
             .method = "session/prompt",
@@ -264,10 +259,11 @@ pub const GeminiCliProvider = struct {
                     .{ .type = "text", .text = prompt },
                 },
             },
-        }, .{}, msg_buf.writer(allocator));
-        try msg_buf.append(allocator, '\n');
+        }, .{});
+        defer allocator.free(msg);
 
-        try self.child.?.stdin.?.writeAll(msg_buf.items);
+        try self.child.?.stdin.?.writeAll(msg);
+        try self.child.?.stdin.?.writeAll("\n");
 
         // Accumulate output
         var result_buf: std.ArrayListUnmanaged(u8) = .empty;

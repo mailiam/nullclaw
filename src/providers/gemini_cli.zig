@@ -181,7 +181,7 @@ pub const GeminiCliProvider = struct {
             .method = "session/new",
             .params = .{
                 .cwd = ".",
-                .mcpServers = &[_]u8{},
+                .mcpServers = &[_][]const u8{},
             },
         }, .{});
         defer self.allocator.free(req);

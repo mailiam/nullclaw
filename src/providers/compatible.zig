@@ -15,6 +15,7 @@ const log = std.log.scoped(.compatible);
 /// Legacy default kept as a named constant for tests only.
 /// Runtime code uses OpenAiCompatibleProvider.max_streaming_prompt_bytes (null = no limit).
 const DEFAULT_MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn logCompatibleApiError(
     allocator: std.mem.Allocator,
@@ -314,6 +315,13 @@ pub const OpenAiCompatibleProvider = struct {
     pub fn shouldSkipStreaming(limit: ?usize, request: ChatRequest) bool {
         const l = limit orelse return false;
         return estimateRequestTextBytes(request) >= l;
+    }
+
+    fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
+        }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 
     /// Build a Responses API request JSON body.
@@ -909,12 +917,8 @@ pub const OpenAiCompatibleProvider = struct {
                 // Cap the fallback timeout to 90 s — if streaming stalled (e.g. speed-limit
                 // triggered after 60 s of zero throughput) the non-streaming endpoint is
                 // likely slow too; avoid blocking for the full message_timeout_secs.
-                const fallback_timeout: u64 = if (request.timeout_secs > 0 and request.timeout_secs < 90)
-                    request.timeout_secs
-                else
-                    90;
                 var fallback_request = request;
-                fallback_request.timeout_secs = fallback_timeout;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
                 var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
@@ -1796,6 +1800,14 @@ test "capNonStreamingMaxTokens leaves request unchanged when limit is unset" {
 
     const capped = p.capNonStreamingMaxTokens(req);
     try std.testing.expectEqual(@as(?u32, 8000), capped.max_tokens);
+}
+
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: a provider that stalls on both streaming and non-streaming
+    // paths must not consume the full message_timeout_secs twice.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(300));
 }
 
 // ════════════════════════════════════════════════════════════════════════════

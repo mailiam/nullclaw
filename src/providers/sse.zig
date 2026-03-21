@@ -10,6 +10,12 @@ const log = std.log.scoped(.provider_sse);
 
 var curl_fail_fast_arg_mutex: std.Thread.Mutex = .{};
 var curl_fail_with_body_supported_cache: ?bool = null;
+const stream_stall_detection_args = [_][]const u8{
+    "--speed-limit",
+    "1",
+    "--speed-time",
+    "60",
+};
 
 fn finalizeStreamResult(
     allocator: std.mem.Allocator,
@@ -92,6 +98,13 @@ pub fn curlFailFastArg(allocator: std.mem.Allocator) []const u8 {
     }
 
     return if (curl_fail_with_body_supported_cache.?) "--fail-with-body" else "-f";
+}
+
+pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
+    for (stream_stall_detection_args) |arg| {
+        argv_buf[argc.*] = arg;
+        argc.* += 1;
+    }
 }
 
 const CurlBodyArg = struct {
@@ -321,14 +334,7 @@ pub fn curlStream(
     // Kill the curl process if transfer rate drops below 1 byte/second for 60 seconds.
     // This catches providers that open the SSE connection but stall mid-stream without
     // hitting the --max-time wall (e.g. glm-5 on infini-ai hanging on large contexts).
-    argv_buf[argc] = "--speed-limit";
-    argc += 1;
-    argv_buf[argc] = "1";
-    argc += 1;
-    argv_buf[argc] = "--speed-time";
-    argc += 1;
-    argv_buf[argc] = "60";
-    argc += 1;
+    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
 
     argv_buf[argc] = "-X";
     argc += 1;
@@ -881,6 +887,20 @@ test "prepareCurlBodyArg uses temp file only on Windows" {
         try std.testing.expect(!prepared.uses_temp_file);
         try std.testing.expectEqualStrings(body[0..], prepared.arg);
     }
+}
+
+test "appendCurlStallDetectionArgs appends curl speed flags in order" {
+    // Regression: stalled SSE streams must trip curl's speed-limit instead of
+    // hanging until --max-time expires with an idle-but-open connection.
+    var argv_buf: [8][]const u8 = undefined;
+    var argc: usize = 0;
+    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
+
+    try std.testing.expectEqual(@as(usize, 4), argc);
+    try std.testing.expectEqualStrings("--speed-limit", argv_buf[0]);
+    try std.testing.expectEqualStrings("1", argv_buf[1]);
+    try std.testing.expectEqualStrings("--speed-time", argv_buf[2]);
+    try std.testing.expectEqualStrings("60", argv_buf[3]);
 }
 
 test "parseSseLine DONE sentinel" {
